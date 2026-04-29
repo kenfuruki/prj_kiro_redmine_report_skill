@@ -8,6 +8,6 @@
   },
   "then": {
     "type": "askAgent",
-    "prompt": "#redmine-api #redmine-project-phases のダッシュボードレポート生成を実行してください。手順: 1) `python .kiro/skills/redmine-api/scripts/dashboard_report.py .kiro/skills/redmine-api/assets/projects_sample.csv --rpm rpm.csv -o dashboard.html` を実行（rpm.csvがない場合は --rpm オプションを省略） 2) 生成されたHTMLを読み込み、id=\"ai-insight-\" で始まるセクションを探す 3) 該当セクションのdata-project-name, data-recent-topics, data-summary, data-progress-report, data-rpm属性からデータを読み取り、#redmine-project-phases のフェーズ別注目ポイントを考慮しながらPMの視点でAI考察を生成して挿入（最大5件） 4) 完了報告"
+    "prompt": "#redmine-api #redmine-project-phases のダッシュボードレポート生成を実行してください。手順: 1) `python .kiro/skills/redmine-api/scripts/dashboard_report.py .kiro/skills/redmine-api/assets/projects_sample.csv --rpm .kiro/skills/redmine-api/assets/rpm.csv -o dashboard.html` を実行（rpm.csvがない場合は --rpm オプションを省略） 2) 生成されたHTMLを読み込み、id=\"ai-insight-\" で始まるセクションを探す 3) 該当セクションのdata-project-name, data-recent-topics, data-summary, data-progress-report, data-rpm属性からデータを読み取り、#redmine-project-phases のフェーズ別注目ポイントを考慮しながらPMの視点でAI考察を生成して挿入（最大10件） 4) 完了報告"
   }
 }

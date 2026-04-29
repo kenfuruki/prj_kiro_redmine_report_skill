@@ -11,3 +11,6 @@ test_dashboard*.html
 # Python
 __pycache__/
 *.pyc
+
+# 実データCSV（サンプルは除外しない）
+rpm.csv

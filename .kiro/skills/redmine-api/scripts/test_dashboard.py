@@ -15,6 +15,7 @@ from dashboard_report import (
     JST, TARGET_TRACKERS, get_checkpoints,
     aggregate_data, generate_html,
     _render_tracker_table, _render_deliverable_table,
+    compute_risk_scores, detect_deadline_risk, resolve_ai_targets,
 )
 
 
@@ -163,7 +164,20 @@ def build_mock_data():
         # 課題: 最近作成
         make_issue(501, "課題", "画面遷移時のエラー", 1, "新規",
                    project_id="prj-beta", created_days_ago=3),
-        # Q/A: なし（データなしのケース）
+        # 課題: 2週間前に作成、期限超過（Risk_Score上昇用）
+        make_issue(502, "課題", "データ不整合の調査", 2, "進行中",
+                   project_id="prj-beta", created_days_ago=13,
+                   due_date=(now - timedelta(days=10)).strftime("%Y-%m-%d"),
+                   journals=[
+                       make_journal(10, status_old=1, status_new=2),
+                   ]),
+        # Q/A: 1週間前に作成、期限未設定（Risk_Score上昇用）
+        make_issue(503, "Q/A", "認証フローの確認", 1, "新規",
+                   project_id="prj-beta", created_days_ago=6),
+        # Q/A: 最近作成、期限超過（Risk_Score上昇用）
+        make_issue(504, "Q/A", "API仕様の不明点", 1, "新規",
+                   project_id="prj-beta", created_days_ago=2,
+                   due_date=(now - timedelta(days=1)).strftime("%Y-%m-%d")),
         # サポート: 3週間前から
         make_issue(601, "サポート", "アカウント発行依頼", 5, "終了",
                    project_id="prj-beta", created_days_ago=20,
@@ -230,13 +244,31 @@ def main():
             if total > 0:
                 print(f"  {tn}: {total}件")
 
+    # Risk_Score算出・トレンド判定・AI考察対象決定
+    print("\nRisk_Score算出中...")
+    risk_scores = compute_risk_scores(projects_issues, cps, status_map)
+    deadline_risk = detect_deadline_risk(risk_scores)
+    print("Risk_Score:")
+    for pid in project_ids:
+        scores = risk_scores.get(pid, [0, 0, 0, 0])
+        flag = deadline_risk.get(pid, False)
+        print(f"  {pid}: {scores} → {'⚠ リスク' if flag else 'OK'}")
+
+    # 自動抽出モック（prj-betaを自動抽出扱いにする）
+    auto_extracted = {"prj-beta"}
+
+    # AI考察対象決定
+    ai_flags_map = {"prj-alpha": True, "prj-beta": False}
+    ai_targets = resolve_ai_targets(project_ids, ai_flags_map, deadline_risk)
+    print(f"\nAI考察対象: {ai_targets}")
+
     # HTML生成
     print("\nHTML生成中...")
     html = generate_html(
         tracker_stats, deliverable_data, cps, project_ids,
         per_project_stats, per_project_deliverables, projects_issues,
         {"prj-alpha": "アルファプロジェクト", "prj-beta": "ベータプロジェクト"},
-        {"prj-alpha": True, "prj-beta": False},
+        ai_flags_map,
         {
             "prj-alpha": {
                 "本部": "IT本部", "部": "開発部", "案件No": "A-001",
@@ -262,7 +294,11 @@ def main():
                 "着手年月": "2026/03", "サービスイン予定日": "2026/07/01",
                 "進捗更新日": "2026/04/22",
             },
-        }
+        },
+        auto_extracted=auto_extracted,
+        risk_scores=risk_scores,
+        deadline_risk=deadline_risk,
+        ai_targets=ai_targets,
     )
 
     output_path = "test_dashboard.html"
@@ -271,6 +307,54 @@ def main():
 
     print(f"\n✅ テスト完了: {output_path} ({len(html):,} bytes)")
     print(f"   ブラウザで開いて確認してください。")
+
+    # --- HTML内容の検証 ---
+    print("\n--- HTML内容の検証 ---")
+    errors = []
+
+    # フィルタ入力欄の存在確認
+    if 'class="col-filter"' in html:
+        print("  ✅ フィルタ入力欄（col-filter）が存在")
+    else:
+        errors.append("フィルタ入力欄（col-filter）が見つかりません")
+
+    # 期限リスク列の存在確認
+    if "期限リスク" in html:
+        print("  ✅ 「期限リスク」列が存在")
+    else:
+        errors.append("「期限リスク」列が見つかりません")
+
+    # 自動抽出バッジの存在確認
+    if "自動抽出" in html:
+        print("  ✅ 「🔍 自動抽出」バッジが存在")
+    else:
+        errors.append("「🔍 自動抽出」バッジが見つかりません")
+
+    # data-risk-scores属性の存在確認
+    if "data-risk-scores" in html:
+        print("  ✅ data-risk-scores属性が存在")
+    else:
+        errors.append("data-risk-scores属性が見つかりません")
+
+    # ソートインジケーター関連のJS存在確認
+    if "sortTable" in html or "sort-indicator" in html or "▲" in html or "data-original-index" in html:
+        print("  ✅ ソート機能関連のコードが存在")
+    else:
+        errors.append("ソート機能関連のコードが見つかりません")
+
+    # project-list-table IDの存在確認
+    if 'id="project-list-table"' in html:
+        print("  ✅ project-list-table IDが存在")
+    else:
+        errors.append("project-list-table IDが見つかりません")
+
+    if errors:
+        print(f"\n❌ 検証エラー: {len(errors)}件")
+        for e in errors:
+            print(f"  - {e}")
+        sys.exit(1)
+    else:
+        print("\n✅ すべての検証に合格しました")
 
 
 if __name__ == "__main__":

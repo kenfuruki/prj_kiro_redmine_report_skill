@@ -127,6 +127,143 @@ def fetch_all_issues_with_subprojects(project_id):
     return all_issues
 
 
+def fetch_issue_qa_count(project_id):
+    """指定プロジェクトの課題トラッカー + Q/Aトラッカーのオープンチケット総数を取得する。
+
+    Redmine APIの /projects/{id}/issues.json を使用し、
+    オープンチケットを取得してトラッカー名が「課題」または「Q/A」のものを合算して返す。
+    プロジェクトが存在しない場合やAPIエラー時は -1 を返す。
+    """
+    total = 0
+    offset = 0
+    limit = 100
+    while True:
+        path = (
+            f"/projects/{project_id}/issues.json"
+            f"?status_id=open&limit={limit}&offset={offset}"
+        )
+        result = api_get(path)
+        if result is None:
+            return -1
+        issues = result.get("issues", [])
+        for issue in issues:
+            tracker_name = issue.get("tracker", {}).get("name", "")
+            if tracker_name in ("課題", "Q/A"):
+                total += 1
+        total_count = result.get("total_count", 0)
+        offset += limit
+        if offset >= total_count:
+            break
+    return total
+
+
+def auto_extract_projects(rpm_data, existing_pids, max_projects=MAX_PROJECTS,
+                          max_extract=5, today=None):
+    """RPM_CSVからサービスイン予定日が操作日以降のプロジェクトを自動抽出する。
+
+    処理手順:
+    1. rpm_dataからサービスイン予定日が操作日以降のレコードを抽出
+    2. existing_pidsに含まれるプロジェクトを除外
+    3. 各プロジェクトの課題+QAチケット総数をAPIから取得
+    4. チケット総数の降順で上位max_extract件を選出
+    5. MAX_PROJECTSを超えない範囲で件数を調整
+
+    Args:
+        rpm_data: load_rpm_data()の戻り値（子案件Noをキーとするdict）
+        existing_pids: Projects_CSVのプロジェクトIDリスト
+        max_projects: プロジェクト数の上限（デフォルト: MAX_PROJECTS）
+        max_extract: 自動抽出の最大件数（デフォルト: 5）
+        today: テスト用の操作日注入（デフォルト: 現在日時）
+
+    Returns:
+        自動抽出されたプロジェクトIDのリスト
+    """
+    if today is None:
+        today = datetime.now(JST)
+    if isinstance(today, datetime):
+        today_date = today.date()
+    else:
+        today_date = today
+
+    existing_set = set(existing_pids)
+
+    # サービスイン予定日のパース（複数フォーマット対応）
+    def parse_service_in_date(date_str):
+        """サービスイン予定日を複数フォーマットでパースする"""
+        if not date_str or not date_str.strip():
+            return None
+        date_str = date_str.strip()
+        formats = [
+            "%Y/%m/%d",    # YYYY/MM/DD
+            "%Y-%m-%d",    # YYYY-MM-DD
+            "%Y年%m月%d日",  # YYYY年MM月DD日
+        ]
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    # 候補プロジェクトの抽出
+    candidates = []
+    for pid, info in rpm_data.items():
+        # existing_pidsに含まれるプロジェクトを除外
+        if pid in existing_set:
+            continue
+
+        # サービスイン予定日を取得・パース
+        service_in_str = info.get("サービスイン予定日", "")
+        if not service_in_str or not service_in_str.strip():
+            continue  # 空欄は除外
+
+        service_in_date = parse_service_in_date(service_in_str)
+        if service_in_date is None:
+            # 不正な日付形式 → スキップして警告
+            print(f"警告: プロジェクト '{pid}' のサービスイン予定日 '{service_in_str}' が不正な日付形式です。スキップします。", file=sys.stderr)
+            continue
+
+        # サービスイン予定日が操作日以降かチェック
+        if service_in_date < today_date:
+            continue
+
+        candidates.append(pid)
+
+    # 各候補プロジェクトのチケット数を取得
+    scored = []
+    for pid in candidates:
+        count = fetch_issue_qa_count(pid)
+        if count < 0:
+            # Redmine上に存在しないプロジェクト → スキップ
+            print(f"警告: プロジェクト '{pid}' はRedmine上に存在しないか、APIエラーが発生しました。スキップします。", file=sys.stderr)
+            continue
+        scored.append((pid, count))
+
+    # チケット数の降順でソート
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # 上位max_extract件を選出
+    extracted = [pid for pid, _ in scored[:max_extract]]
+
+    # MAX_PROJECTSを超えない範囲で件数を調整
+    remaining = max_projects - len(existing_pids)
+    if remaining < 0:
+        remaining = 0
+    if len(extracted) > remaining:
+        extracted = extracted[:remaining]
+
+    # ログ出力
+    if extracted:
+        print(f"自動抽出: {len(extracted)}件のプロジェクトを追加", file=sys.stderr)
+        for pid in extracted:
+            count = next((c for p, c in scored if p == pid), 0)
+            print(f"  → {pid} (課題+QA: {count}件)", file=sys.stderr)
+    else:
+        print("自動抽出: 該当プロジェクトなし（0件）", file=sys.stderr)
+
+    return extracted
+
+
 # --- CSV読み込み ---
 
 def load_project_ids(csv_path):
@@ -251,6 +388,87 @@ def resolve_status_name(status_str, status_map):
     return status_str
 
 
+# --- 期限リスク検知 ---
+
+# 完了ステータス名のセット（Overdue/Blank算出で除外する）
+CLOSED_STATUSES = {"解決", "終了", "却下"}
+
+
+def _is_overdue_at(issue, checkpoint_dt, status_map):
+    """指定時点でチケットが期限超過かどうかを判定する。
+
+    条件:
+    - due_dateが存在し、checkpoint_dtより前である
+    - 指定時点のステータスが未完了（CLOSED_STATUSES以外）である
+    - チケットが指定時点で作成済みである
+
+    Args:
+        issue: チケットdict（due_date, status, journals等を含む）
+        checkpoint_dt: 判定時点のdatetime
+        status_map: ステータスID→名前マッピング
+
+    Returns:
+        True: 期限超過かつ未完了, False: それ以外
+    """
+    # ステータスを復元
+    status_raw = get_status_at(issue, checkpoint_dt)
+    if status_raw is None:
+        return False  # まだ作成されていない
+    status_name = resolve_status_name(status_raw, status_map)
+    if status_name in CLOSED_STATUSES:
+        return False  # 完了済み
+
+    # due_dateの確認
+    due_date_str = issue.get("due_date")
+    if not due_date_str:
+        return False  # 期限未設定はoverdueではない（blank_dueで扱う）
+
+    try:
+        due_date = datetime.strptime(due_date_str, "%Y-%m-%d")
+        # checkpoint_dtと比較するためtimezone-naiveに変換
+        checkpoint_naive = checkpoint_dt.replace(tzinfo=None) if checkpoint_dt.tzinfo else checkpoint_dt
+        return due_date < checkpoint_naive
+    except (ValueError, TypeError):
+        return False  # 不正な日付形式 → 期限未設定として扱う
+
+
+def _is_blank_due_at(issue, checkpoint_dt, status_map):
+    """指定時点でチケットが期限未設定かどうかを判定する。
+
+    条件:
+    - due_dateが空欄（未設定）である
+    - 指定時点のステータスが未完了（CLOSED_STATUSES以外）である
+    - チケットが指定時点で作成済みである
+
+    Args:
+        issue: チケットdict（due_date, status, journals等を含む）
+        checkpoint_dt: 判定時点のdatetime
+        status_map: ステータスID→名前マッピング
+
+    Returns:
+        True: 期限未設定かつ未完了, False: それ以外
+    """
+    # ステータスを復元
+    status_raw = get_status_at(issue, checkpoint_dt)
+    if status_raw is None:
+        return False  # まだ作成されていない
+    status_name = resolve_status_name(status_raw, status_map)
+    if status_name in CLOSED_STATUSES:
+        return False  # 完了済み
+
+    # due_dateの確認
+    due_date_str = issue.get("due_date")
+    if not due_date_str or not due_date_str.strip():
+        return True  # 期限未設定かつ未完了
+
+    # 不正な日付形式も期限未設定として扱う
+    try:
+        datetime.strptime(due_date_str, "%Y-%m-%d")
+        return False  # 有効な日付がある → blank_dueではない
+    except (ValueError, TypeError):
+        return True  # パース失敗 → 期限未設定として扱う
+
+
 # --- 集計 ---
 
 def aggregate_data(projects_issues, status_map):
@@ -309,6 +527,118 @@ def aggregate_data(projects_issues, status_map):
                 per_project_deliverables[project_id].append(entry)
 
     return tracker_stats, deliverable_data, checkpoints, per_project_stats, per_project_deliverables
+
+
+# --- Risk_Score算出・トレンド判定・AI考察対象決定 ---
+
+def compute_risk_scores(projects_issues, checkpoints, status_map):
+    """各プロジェクト・各CheckpointのRisk_Scoreを算出する。
+
+    Risk_Score = Overdue_Count + Blank_Due_Count
+    - Overdue_Count: due_date < Checkpoint日 かつ ステータスが未完了のチケット数
+    - Blank_Due_Count: due_date が空欄 かつ ステータスが未完了のチケット数
+    - 未完了 = ステータスが「解決」「終了」「却下」以外
+
+    対象トラッカー: 課題、Q/A のみ
+
+    Args:
+        projects_issues: {project_id: [issue_dict, ...]}
+        checkpoints: [(label, datetime), ...] 4定点
+        status_map: ステータスID→名前マッピング
+
+    Returns:
+        {project_id: [risk_score_3w, risk_score_2w, risk_score_1w, risk_score_now]}
+    """
+    risk_target_trackers = {"課題", "Q/A"}
+    result = {}
+
+    for pid, issues in projects_issues.items():
+        scores = []
+        for _label, cp_dt in checkpoints:
+            overdue = 0
+            blank_due = 0
+            for issue in issues:
+                tracker_name = issue.get("tracker", {}).get("name", "")
+                if tracker_name not in risk_target_trackers:
+                    continue
+                if _is_overdue_at(issue, cp_dt, status_map):
+                    overdue += 1
+                elif _is_blank_due_at(issue, cp_dt, status_map):
+                    blank_due += 1
+            scores.append(overdue + blank_due)
+        result[pid] = scores
+
+    return result
+
+
+def detect_deadline_risk(risk_scores):
+    """4定点のRisk_Score推移から上昇傾向を判定する。
+
+    判定ロジック:
+    - 3区間（3w→2w, 2w→1w, 1w→now）のうち2区間以上でRisk_Scoreが増加 → True
+    - 4定点すべてRisk_Score=0 → False
+
+    Args:
+        risk_scores: {project_id: [score_3w, score_2w, score_1w, score_now]}
+
+    Returns:
+        {project_id: True/False}
+    """
+    result = {}
+    for pid, scores in risk_scores.items():
+        # 4定点すべて0 → 上昇傾向ではない
+        if all(s == 0 for s in scores):
+            result[pid] = False
+            continue
+
+        # 3区間の増加判定
+        increases = 0
+        for i in range(len(scores) - 1):
+            if scores[i + 1] > scores[i]:
+                increases += 1
+
+        result[pid] = increases >= 2
+
+    return result
+
+
+def resolve_ai_targets(project_ids, ai_flags, deadline_risk, ai_max=10):
+    """AI考察対象プロジェクトを決定する。
+
+    優先順位:
+    1. CSVのai_flag=Trueのプロジェクト（project_idsの順序で）
+    2. Deadline_Risk_Flag=Trueのプロジェクト（project_idsの順序で）
+    重複は除外し、合計ai_max件まで。
+
+    Args:
+        project_ids: 全プロジェクトIDリスト（CSV + 自動抽出）
+        ai_flags: {pid: bool} CSVのai_flag
+        deadline_risk: {pid: bool} detect_deadline_riskの戻り値
+        ai_max: AI考察の上限（デフォルト: 10）
+
+    Returns:
+        AI考察対象のプロジェクトIDセット
+    """
+    targets = []
+    seen = set()
+
+    # 1. ai_flag=Trueのプロジェクトを優先
+    for pid in project_ids:
+        if len(targets) >= ai_max:
+            break
+        if ai_flags.get(pid) and pid not in seen:
+            targets.append(pid)
+            seen.add(pid)
+
+    # 2. Deadline_Risk_Flag=Trueのプロジェクトを追加
+    for pid in project_ids:
+        if len(targets) >= ai_max:
+            break
+        if deadline_risk.get(pid) and pid not in seen:
+            targets.append(pid)
+            seen.add(pid)
+
+    return set(targets)
 
 
 # --- HTML生成 ---
@@ -639,8 +969,12 @@ def _render_recent_topics(issues):
     return "\n".join(parts)
 
 
-def _render_ai_placeholder(project_id, project_name, issues, tracker_stats, rpm_info=None):
+def _render_ai_placeholder(project_id, project_name, issues, tracker_stats, rpm_info=None, risk_scores=None, deadline_risk=None):
     """AI考察プレースホルダーHTMLを生成する"""
+    if risk_scores is None:
+        risk_scores = {}
+    if deadline_risk is None:
+        deadline_risk = {}
     # Kiroが後から考察テキストを挿入するためのプレースホルダー
     # data属性にプロジェクト情報を埋め込み、Kiroが識別できるようにする
     topics = _get_recent_issue_topics(issues)
@@ -670,6 +1004,12 @@ def _render_ai_placeholder(project_id, project_name, issues, tracker_stats, rpm_
                 rpm_parts.append(f"{k}:{v}")
         rpm_summary = ", ".join(rpm_parts).replace('"', '&quot;')
 
+    # data-risk-scores属性（Deadline_Risk_Flagプロジェクトの場合）
+    risk_scores_attr = ''
+    if deadline_risk.get(project_id):
+        scores_list = risk_scores.get(project_id, [0, 0, 0, 0])
+        risk_scores_attr = f' data-risk-scores="{",".join(str(s) for s in scores_list)}"'
+
     return (
         f'<div class="sec" id="ai-insight-{project_id}" '
         f'data-project="{project_id}" '
@@ -677,13 +1017,231 @@ def _render_ai_placeholder(project_id, project_name, issues, tracker_stats, rpm_
         f'data-recent-topics="{topic_titles}" '
         f'data-summary="{", ".join(summary_parts)}" '
         f'data-progress-report="{report_text}" '
-        f'data-rpm="{rpm_summary}">'
+        f'data-rpm="{rpm_summary}"{risk_scores_attr}>'
         f'<h3>🤖 AI考察</h3>'
         f'<div class="ai-content" style="font:var(--fw) 14px/1.7 var(--ff);color:var(--c-g7);'
         f'background:var(--c-b1);border-radius:var(--r);padding:16px;border-left:4px solid var(--c-b7);">'
         f'<p style="color:var(--c-g5);font-style:italic;">Kiroによる考察が挿入されます。'
         f'ダッシュボード生成後、Kiroに「AI考察を生成して」と指示してください。</p>'
         f'</div></div>')
+
+
+def _render_risk_score_table(pid, risk_scores, checkpoints):
+    """詳細ページ用のRisk_Score推移テーブルHTMLを生成する。
+
+    4定点のRisk_Score推移を数値テーブルとして表示する。
+
+    Args:
+        pid: プロジェクトID
+        risk_scores: {project_id: [score_3w, score_2w, score_1w, score_now]}
+        checkpoints: [(label, datetime), ...]
+
+    Returns:
+        Risk_Score推移テーブルのHTML文字列。データがない場合は空文字列。
+    """
+    scores = risk_scores.get(pid)
+    if not scores:
+        return ""
+    checkpoint_labels = [c[0] for c in checkpoints]
+    checkpoint_dates = [c[1].strftime("%m/%d") for c in checkpoints]
+
+    parts = []
+    parts.append('<div class="sec"><h3>⚠ 期限リスクスコア推移</h3>')
+    parts.append('<table><thead><tr><th class="tp">指標</th>')
+    for label, date_str in zip(checkpoint_labels, checkpoint_dates):
+        parts.append(f'<th class="ts">{label}<br>({date_str})</th>')
+    parts.append('<th class="ts">増減</th></tr></thead><tbody>')
+
+    # Risk_Score行
+    parts.append('<tr><td style="text-align:left;font-weight:var(--font-weight-bold);">Risk_Score<br><span style="font-size:11px;color:var(--c-g5);">(期限超過+期限未設定)</span></td>')
+    for s in scores:
+        if s > 0:
+            parts.append(f'<td style="font-weight:var(--fb);color:var(--c-er2);">{s}</td>')
+        else:
+            parts.append('<td>0</td>')
+    # 増減
+    first_val = scores[0]
+    last_val = scores[-1]
+    diff = last_val - first_val
+    if diff > 0:
+        parts.append(f'<td class="trend-up" style="color:var(--c-er2);font-weight:var(--fb);">+{diff}</td>')
+    elif diff < 0:
+        parts.append(f'<td class="trend-down" style="color:var(--c-ok2);font-weight:var(--fb);">{diff}</td>')
+    else:
+        parts.append('<td class="trend-flat">±0</td>')
+    parts.append('</tr>')
+
+    # トレンド行
+    parts.append('<tr><td style="text-align:left;">トレンド</td>')
+    for i in range(len(scores)):
+        if i == 0:
+            parts.append('<td>-</td>')
+        else:
+            d = scores[i] - scores[i - 1]
+            if d > 0:
+                parts.append(f'<td style="color:var(--c-er2);">↑+{d}</td>')
+            elif d < 0:
+                parts.append(f'<td style="color:var(--c-ok2);">↓{d}</td>')
+            else:
+                parts.append('<td style="color:var(--c-g5);">→±0</td>')
+    parts.append('<td>-</td></tr>')
+
+    parts.append('</tbody></table></div>')
+    return "\n".join(parts)
+
+
+def _render_filter_sort_js():
+    """フィルタ・ソート用のインラインJavaScriptを生成する。
+
+    機能:
+    - テーブルID「project-list-table」を対象
+    - 各列ヘッダー直下の <input class="col-filter"> による部分一致フィルタ（indexOf使用）
+    - 複数列のAND条件フィルタ
+    - 列ヘッダークリックによる3段階ソート（none → asc → desc → none）
+    - 数値列は数値比較ソート、テキスト列はlocaleCompareによる文字列比較
+    - ソートインジケーター（▲/▼）表示
+    - 元の順序を data-original-index で保持し、ソート解除時に復元
+    - 空文字はソート時に最後尾に配置
+    - フィルタ入力欄にデジタル庁デザインシステムv2準拠のスタイルを適用
+    - キーボード操作（Tab移動、Enter確定）に対応
+    - 外部ライブラリに依存しない
+
+    Returns:
+        インラインJavaScript文字列
+    """
+    return """
+(function(){
+  var table = document.getElementById('project-list-table');
+  if (!table) return;
+  var thead = table.querySelector('thead');
+  var tbody = table.querySelector('tbody');
+  if (!thead || !tbody) return;
+
+  // ソート状態: {col: number, dir: 'asc'|'desc'|'none'}
+  var sortState = {col: -1, dir: 'none'};
+
+  // 数値列の判定用インデックスセット（ヘッダーテキストで判定）
+  var numCols = {};
+  var headers = thead.querySelectorAll('tr:first-child th');
+  for (var i = 0; i < headers.length; i++) {
+    var txt = headers[i].textContent.trim();
+    if (['チケット数','課題','Q/A','サポート','成果物'].indexOf(txt) >= 0) {
+      numCols[i] = true;
+    }
+  }
+
+  // フィルタ処理
+  function applyFilters() {
+    var filters = table.querySelectorAll('input.col-filter');
+    var rows = tbody.querySelectorAll('tr');
+    for (var r = 0; r < rows.length; r++) {
+      var show = true;
+      var cells = rows[r].querySelectorAll('td');
+      for (var f = 0; f < filters.length; f++) {
+        var val = filters[f].value.toLowerCase();
+        if (!val) continue;
+        var colIdx = parseInt(filters[f].getAttribute('data-col'), 10);
+        if (colIdx >= cells.length) { show = false; break; }
+        var cellText = cells[colIdx].textContent.toLowerCase();
+        if (cellText.indexOf(val) < 0) { show = false; break; }
+      }
+      rows[r].style.display = show ? '' : 'none';
+    }
+  }
+
+  // フィルタ入力イベント
+  var filterInputs = table.querySelectorAll('input.col-filter');
+  for (var fi = 0; fi < filterInputs.length; fi++) {
+    filterInputs[fi].addEventListener('input', applyFilters);
+    filterInputs[fi].addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { applyFilters(); }
+    });
+    // フィルタ入力欄のクリックでソートが発火しないようにする
+    filterInputs[fi].addEventListener('click', function(e) { e.stopPropagation(); });
+  }
+
+  // ソートインジケーター更新
+  function updateIndicators() {
+    for (var i = 0; i < headers.length; i++) {
+      var ind = headers[i].querySelector('.sort-ind');
+      if (ind) {
+        if (sortState.col === i) {
+          ind.textContent = sortState.dir === 'asc' ? ' \\u25B2' : sortState.dir === 'desc' ? ' \\u25BC' : '';
+        } else {
+          ind.textContent = '';
+        }
+      }
+    }
+  }
+
+  // ソートインジケーター要素を各ヘッダーに追加
+  for (var si = 0; si < headers.length; si++) {
+    var span = document.createElement('span');
+    span.className = 'sort-ind';
+    span.style.fontSize = '11px';
+    span.style.marginLeft = '2px';
+    headers[si].appendChild(span);
+    headers[si].style.cursor = 'pointer';
+    headers[si].setAttribute('data-col-idx', si);
+    headers[si].addEventListener('click', function() {
+      var colIdx = parseInt(this.getAttribute('data-col-idx'), 10);
+      sortTable(colIdx);
+    });
+  }
+
+  // ソート処理
+  function sortTable(colIdx) {
+    // 3段階トグル
+    if (sortState.col === colIdx) {
+      if (sortState.dir === 'asc') sortState.dir = 'desc';
+      else if (sortState.dir === 'desc') { sortState.dir = 'none'; sortState.col = -1; }
+      else sortState.dir = 'asc';
+    } else {
+      sortState.col = colIdx;
+      sortState.dir = 'asc';
+    }
+
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+
+    if (sortState.dir === 'none') {
+      // 元の順序に復元
+      rows.sort(function(a, b) {
+        var ai = parseInt(a.getAttribute('data-original-index'), 10) || 0;
+        var bi = parseInt(b.getAttribute('data-original-index'), 10) || 0;
+        return ai - bi;
+      });
+    } else {
+      var isNum = !!numCols[colIdx];
+      var asc = sortState.dir === 'asc';
+      rows.sort(function(a, b) {
+        var ac = a.querySelectorAll('td');
+        var bc = b.querySelectorAll('td');
+        var av = colIdx < ac.length ? ac[colIdx].textContent.trim() : '';
+        var bv = colIdx < bc.length ? bc[colIdx].textContent.trim() : '';
+        // 空文字は最後尾
+        if (av === '' && bv === '') return 0;
+        if (av === '') return 1;
+        if (bv === '') return -1;
+        var result;
+        if (isNum) {
+          var an = parseFloat(av.replace(/[^\\d.\\-]/g, '')) || 0;
+          var bn = parseFloat(bv.replace(/[^\\d.\\-]/g, '')) || 0;
+          result = an - bn;
+        } else {
+          result = av.localeCompare(bv, 'ja');
+        }
+        return asc ? result : -result;
+      });
+    }
+
+    // DOMに反映
+    for (var i = 0; i < rows.length; i++) {
+      tbody.appendChild(rows[i]);
+    }
+    updateIndicators();
+  }
+})();
+"""
 
 
 def _render_trend_chart(tracker_name, stats, checkpoint_labels, checkpoint_dates):
@@ -747,7 +1305,9 @@ def _render_trend_chart(tracker_name, stats, checkpoint_labels, checkpoint_dates
 
 def generate_html(tracker_stats, deliverable_data, checkpoints, project_ids,
                    per_project_stats, per_project_deliverables, projects_issues,
-                   project_names=None, ai_flags=None, rpm_data=None):
+                   project_names=None, ai_flags=None, rpm_data=None,
+                   auto_extracted=None, risk_scores=None, deadline_risk=None,
+                   ai_targets=None):
     """一覧ページ＋プロジェクト別詳細ページを含むHTMLダッシュボードを生成する"""
     if project_names is None:
         project_names = {}
@@ -755,6 +1315,14 @@ def generate_html(tracker_stats, deliverable_data, checkpoints, project_ids,
         ai_flags = {}
     if rpm_data is None:
         rpm_data = {}
+    if auto_extracted is None:
+        auto_extracted = set()
+    if risk_scores is None:
+        risk_scores = {}
+    if deadline_risk is None:
+        deadline_risk = {}
+    if ai_targets is None:
+        ai_targets = set()
     now = datetime.now(JST).strftime("%Y年%m月%d日 %H:%M")
     checkpoint_labels = [c[0] for c in checkpoints]
     checkpoint_dates = [c[1].strftime("%m/%d") for c in checkpoints]
@@ -809,20 +1377,22 @@ th{font-weight:var(--fb);background:var(--c-g1);color:var(--c-g7)}
     h.append(f'<p class="meta">生成日時: {now} ｜ 対象プロジェクト: {len(project_ids)}件</p></header>')
 
     # ===== 一覧ページ =====
-    # AIフラグ付きプロジェクトの先頭5件を特定
-    AI_MAX = 5
-    ai_enabled_pids = set()
-    ai_cnt = 0
-    for pid in project_ids:
-        if ai_flags.get(pid) and ai_cnt < AI_MAX:
-            ai_enabled_pids.add(pid)
-            ai_cnt += 1
+    # AI考察対象プロジェクトの特定（ai_targetsが渡されていればそれを使用）
+    AI_MAX = 10
+    ai_enabled_pids = ai_targets if ai_targets else set()
+    if not ai_targets:
+        # フォールバック: ai_flagsから上位AI_MAX件を選出
+        ai_cnt = 0
+        for pid in project_ids:
+            if ai_flags.get(pid) and ai_cnt < AI_MAX:
+                ai_enabled_pids.add(pid)
+                ai_cnt += 1
     h.append('<div id="page-list" class="page active">')
     h.append('<section class="sec"><h2>プロジェクト一覧</h2>')
     # テーブルヘッダー
     tracker_cols = ["課題", "Q/A", "サポート", "成果物"]
     has_rpm = bool(rpm_data)
-    h.append('<table><thead><tr>')
+    h.append('<table id="project-list-table"><thead><tr>')
     h.append('<th class="tp" style="text-align:left;">プロジェクト</th>')
     if has_rpm:
         h.append('<th class="tp">影響度</th>')
@@ -834,16 +1404,36 @@ th{font-weight:var(--fb);background:var(--c-g1);color:var(--c-g7)}
     h.append('<th class="tp">チケット数</th>')
     for tn in tracker_cols:
         h.append(f'<th class="ts">{tn}</th>')
+    h.append('<th class="ts">期限リスク</th>')
     h.append('<th class="ts">AI</th>')
-    h.append('</tr></thead><tbody>')
-    for pid in project_ids:
+    h.append('</tr>')
+    # フィルタ入力行
+    col_count = 1 + (6 if has_rpm else 0) + 1 + len(tracker_cols) + 1 + 1  # プロジェクト + rpm列 + チケット数 + トラッカー列 + 期限リスク + AI
+    h.append('<tr>')
+    for ci in range(col_count):
+        h.append(f'<td style="padding:4px 6px;"><input class="col-filter" data-col="{ci}" type="text" '
+                 f'placeholder="フィルタ" aria-label="列{ci+1}のフィルタ" '
+                 f'style="width:100%;padding:4px 8px;font:var(--fw) 12px/1.3 var(--ff);'
+                 f'border:1px solid var(--c-g3);border-radius:var(--rs);background:var(--c-w);'
+                 f'color:var(--c-g7);box-sizing:border-box;"></td>')
+    h.append('</tr>')
+    h.append('</thead><tbody>')
+    for row_idx, pid in enumerate(project_ids):
         ic = len(projects_issues.get(pid, []))
         ps = per_project_stats.get(pid, {})
         pname = project_names.get(pid, pid)
         rpm = rpm_data.get(pid, {})
         ai_badge = '🤖' if pid in ai_enabled_pids else ''
-        h.append(f'<tr style="cursor:pointer;" tabindex="0" role="button" aria-label="プロジェクト {pid} の詳細を表示" onclick="go(\'{pid}\')" onkeydown="if(event.key===\'Enter\')go(\'{pid}\')">')
-        h.append(f'<td style="text-align:left;"><strong style="color:var(--c-b7);">{pname}</strong><br><span style="font-size:12px;color:var(--c-g5);">{pid}</span></td>')
+        # 自動抽出バッジ
+        auto_badge = ' <span style="display:inline-block;font-size:11px;padding:1px 6px;border-radius:var(--rs);background:#E8F4FF;color:var(--c-b7);font-weight:var(--fb);margin-left:4px;">🔍 自動抽出</span>' if pid in auto_extracted else ''
+        # 期限リスクバッジ（プロジェクト名セルに表示）
+        risk_badge = ''
+        if deadline_risk.get(pid):
+            scores_list = risk_scores.get(pid, [0, 0, 0, 0])
+            trend_str = '→'.join(str(s) for s in scores_list)
+            risk_badge = f' <span style="display:inline-block;font-size:11px;padding:1px 6px;border-radius:var(--rs);background:#FFF3E0;color:#B40000;font-weight:var(--fb);margin-left:4px;" title="Risk_Score推移: {trend_str}">⚠ 期限リスク</span>'
+        h.append(f'<tr data-original-index="{row_idx}" style="cursor:pointer;" tabindex="0" role="button" aria-label="プロジェクト {pid} の詳細を表示" onclick="go(\'{pid}\')" onkeydown="if(event.key===\'Enter\')go(\'{pid}\')">')
+        h.append(f'<td style="text-align:left;"><strong style="color:var(--c-b7);">{pname}</strong>{auto_badge}{risk_badge}<br><span style="font-size:12px;color:var(--c-g5);">{pid}</span></td>')
         if has_rpm:
             h.append(f'<td>{rpm.get("影響度区分", "-")}</td>')
             h.append(f'<td>{rpm.get("重要案件区分", "-")}</td>')
@@ -862,6 +1452,13 @@ th{font-weight:var(--fb);background:var(--c-g1);color:var(--c-g7)}
             elif df < 0: diff_html = f' <span class="td" style="font-size:11px;">{df}</span>'
             else: diff_html = ''
             h.append(f'<td>{tn_now}{diff_html}</td>')
+        # 期限リスク列
+        if deadline_risk.get(pid):
+            scores_list = risk_scores.get(pid, [0, 0, 0, 0])
+            trend_str = '→'.join(str(s) for s in scores_list)
+            h.append(f'<td style="color:var(--c-er2);font-weight:var(--fb);" title="Risk_Score推移: {trend_str}">⚠ あり</td>')
+        else:
+            h.append('<td style="color:var(--c-g5);">-</td>')
         h.append(f'<td>{ai_badge}</td>')
         h.append('</tr>')
     h.append('</tbody></table>')
@@ -870,7 +1467,6 @@ th{font-weight:var(--fb);background:var(--c-g1);color:var(--c-g7)}
     h.append('</div>')
 
     # ===== 詳細ページ（プロジェクトごと） =====
-    ai_count = 0
     for pid in project_ids:
         ps = per_project_stats.get(pid, {})
         pd = per_project_deliverables.get(pid, [])
@@ -905,10 +1501,11 @@ th{font-weight:var(--fb);background:var(--c-g1);color:var(--c-g7)}
         h.append(_render_progress_report(projects_issues.get(pid, [])))
         # 課題トピック（直近1週間）
         h.append(_render_recent_topics(projects_issues.get(pid, [])))
-        # AI考察（AIフラグ付き、上限5件まで）
-        if ai_flags.get(pid) and ai_count < AI_MAX:
-            h.append(_render_ai_placeholder(pid, pname, projects_issues.get(pid, []), ps, rpm_data.get(pid)))
-            ai_count += 1
+        # Risk_Score推移テーブル（期限リスクデータがある場合）
+        h.append(_render_risk_score_table(pid, risk_scores, checkpoints))
+        # AI考察（ai_targetsセットベース）
+        if pid in ai_enabled_pids:
+            h.append(_render_ai_placeholder(pid, pname, projects_issues.get(pid, []), ps, rpm_data.get(pid), risk_scores=risk_scores, deadline_risk=deadline_risk))
         # 折れ線グラフ（課題・Q/A・サポート）
         for tn in ["課題", "Q/A", "サポート"]:
             chart_html = _render_trend_chart(tn, ps.get(tn, {}), checkpoint_labels, checkpoint_dates)
@@ -918,6 +1515,7 @@ th{font-weight:var(--fb);background:var(--c-g1);color:var(--c-g7)}
         h.append('</section></div>')
 
     h.append('<script>function go(p){document.querySelectorAll(".page").forEach(function(e){e.classList.remove("active")});var el=document.getElementById("page-"+p);if(el){el.classList.add("active");window.scrollTo(0,0)}}function back(){document.querySelectorAll(".page").forEach(function(e){e.classList.remove("active")});document.getElementById("page-list").classList.add("active");window.scrollTo(0,0)}</script>')
+    h.append(f'<script>{_render_filter_sort_js()}</script>')
     h.append(f'<footer class="ft">デジタル庁デザインシステム v2 準拠 ｜ Redmine API Skill</footer>')
     h.append('</body></html>')
     return "\n".join(h)
@@ -951,6 +1549,15 @@ def main():
         rpm_data = load_rpm_data(args.rpm)
         print(f"  → {len(rpm_data)}件のプロジェクト補助データを取得", file=sys.stderr)
 
+    # 自動抽出処理（--rpm指定時のみ）
+    auto_extracted = set()
+    if args.rpm and rpm_data:
+        extracted_pids = auto_extract_projects(rpm_data, project_ids)
+        for pid in extracted_pids:
+            project_ids.append(pid)
+            ai_flags[pid] = False
+            auto_extracted.add(pid)
+
     # ステータスマッピング取得
     print("ステータス情報を取得中...", file=sys.stderr)
     status_map = fetch_status_map()
@@ -969,11 +1576,26 @@ def main():
     print("データを集計中...", file=sys.stderr)
     tracker_stats, deliverable_data, checkpoints, per_project_stats, per_project_deliverables = aggregate_data(projects_issues, status_map)
 
+    # Risk_Score算出・トレンド判定
+    print("期限リスクを分析中...", file=sys.stderr)
+    risk_scores = compute_risk_scores(projects_issues, checkpoints, status_map)
+    deadline_risk = detect_deadline_risk(risk_scores)
+    risk_count = sum(1 for v in deadline_risk.values() if v)
+    print(f"  → 期限リスク検知: {risk_count}件", file=sys.stderr)
+
+    # AI考察対象決定
+    ai_targets = resolve_ai_targets(project_ids, ai_flags, deadline_risk)
+    print(f"  → AI考察対象: {len(ai_targets)}件", file=sys.stderr)
+
     # HTML生成
     print("HTMLダッシュボードを生成中...", file=sys.stderr)
     html = generate_html(tracker_stats, deliverable_data, checkpoints, project_ids,
                           per_project_stats, per_project_deliverables, projects_issues,
-                          project_names, ai_flags, rpm_data)
+                          project_names, ai_flags, rpm_data,
+                          auto_extracted=auto_extracted,
+                          risk_scores=risk_scores,
+                          deadline_risk=deadline_risk,
+                          ai_targets=ai_targets)
 
     # 出力
     with open(args.output, "w", encoding="utf-8") as f:

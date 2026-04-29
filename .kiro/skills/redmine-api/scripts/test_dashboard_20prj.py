@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dashboard_report import (
     JST, TARGET_TRACKERS, get_checkpoints,
     aggregate_data, generate_html,
+    compute_risk_scores, detect_deadline_risk, resolve_ai_targets,
 )
 
 random.seed(42)
@@ -156,6 +157,20 @@ def main():
         print(f"  {tn}: {total}件")
     print(f"  成果物（予実対象）: {len(deliverable_data)}件")
 
+    # Risk_Score算出・トレンド判定
+    risk_scores = compute_risk_scores(projects_issues, cps, STATUS_MAP)
+    deadline_risk = detect_deadline_risk(risk_scores)
+    print(f"\n期限リスク検知:")
+    risk_count = sum(1 for v in deadline_risk.values() if v)
+    print(f"  ⚠ 期限リスクあり: {risk_count}件")
+
+    # 自動抽出モック（最後の3プロジェクトを自動抽出扱い）
+    auto_extracted = set(project_ids[-3:])
+
+    # AI考察対象決定
+    ai_targets = resolve_ai_targets(project_ids, ai_flags, deadline_risk)
+    print(f"  AI考察対象: {len(ai_targets)}件")
+
     # HTML生成
     t4 = time.time()
     # rpm.csvモックデータ
@@ -183,7 +198,11 @@ def main():
     html = generate_html(
         tracker_stats, deliverable_data, cps, project_ids,
         per_project_stats, per_project_deliverables, projects_issues,
-        project_names, ai_flags, rpm_data
+        project_names, ai_flags, rpm_data,
+        auto_extracted=auto_extracted,
+        risk_scores=risk_scores,
+        deadline_risk=deadline_risk,
+        ai_targets=ai_targets,
     )
     t5 = time.time()
     print(f"\nHTML生成: {t5-t4:.2f}秒")
@@ -197,6 +216,33 @@ def main():
     print(f"合計処理時間: {t5-t0:.2f}秒")
     print(f"\n✅ テスト完了: {output_path}")
     print(f"   ブラウザで開いて動作確認してください。")
+
+    # --- HTML内容の検証 ---
+    print("\n--- HTML内容の検証 ---")
+    errors = []
+
+    if 'class="col-filter"' in html:
+        print("  ✅ フィルタ入力欄（col-filter）が存在")
+    else:
+        errors.append("フィルタ入力欄（col-filter）が見つかりません")
+
+    if "期限リスク" in html:
+        print("  ✅ 「期限リスク」列が存在")
+    else:
+        errors.append("「期限リスク」列が見つかりません")
+
+    if "自動抽出" in html:
+        print("  ✅ 「🔍 自動抽出」バッジが存在")
+    else:
+        errors.append("「🔍 自動抽出」バッジが見つかりません")
+
+    if errors:
+        print(f"\n❌ 検証エラー: {len(errors)}件")
+        for e in errors:
+            print(f"  - {e}")
+        sys.exit(1)
+    else:
+        print("\n✅ すべての検証に合格しました")
 
 
 if __name__ == "__main__":
