@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "name": "Redmine ダッシュボード生成",
+  "description": "Redmineのプロジェクトダッシュボード（HTML）を生成します。CSVファイルからプロジェクト一覧を読み込み、チケット状況の集計・グラフ・成果物予実・AI考察を含むHTMLレポートを出力します。",
+  "version": "1",
+  "when": {
+    "type": "userTriggered"
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "#redmine-api #redmine-project-phases のダッシュボードレポート生成を実行してください。手順: 1) `python .kiro/skills/redmine-api/scripts/dashboard_report.py .kiro/skills/redmine-api/assets/projects_sample.csv --rpm rpm.csv -o dashboard.html` を実行（rpm.csvがない場合は --rpm オプションを省略） 2) 生成されたHTMLを読み込み、id=\"ai-insight-\" で始まるセクションを探す 3) 該当セクションのdata-project-name, data-recent-topics, data-summary, data-progress-report, data-rpm属性からデータを読み取り、#redmine-project-phases のフェーズ別注目ポイントを考慮しながらPMの視点でAI考察を生成して挿入（最大5件） 4) 完了報告"
+  }
+}

@@ -1,0 +1,6 @@
+# 秘密情報 - Kiroからのアクセスをブロック
+.env
+.env.*
+!.env.example
+*.pem
+*.key

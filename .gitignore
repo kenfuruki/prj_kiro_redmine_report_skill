@@ -1,0 +1,13 @@
+# 秘密情報
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# テスト生成物
+test_dashboard*.html
+
+# Python
+__pycache__/
+*.pyc
