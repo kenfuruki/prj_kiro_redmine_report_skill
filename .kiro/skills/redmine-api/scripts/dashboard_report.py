@@ -87,6 +87,44 @@ def get_checkpoints():
 
 # --- API ---
 
+def _load_env_file():
+    """ワークスペースルートの .env ファイルを自動読み込みする。
+    既に環境変数がセットされている場合は上書きしない。
+    """
+    # スクリプトの位置から .env を探す（scripts/ → redmine-api/ → skills/ → .kiro/ → ワークスペースルート）
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, "..", "..", "..", "..", ".env"),  # .kiro/skills/redmine-api/scripts/ → ルート
+        os.path.join(script_dir, "..", "..", "..", ".env"),
+        os.path.join(script_dir, "..", ".env"),
+        os.path.join(script_dir, ".env"),
+        os.path.join(os.getcwd(), ".env"),
+    ]
+    for env_path in candidates:
+        env_path = os.path.normpath(env_path)
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            key, _, value = line.partition("=")
+                            key = key.strip()
+                            value = value.strip()
+                            # 既存の環境変数は上書きしない
+                            if key and not os.environ.get(key):
+                                os.environ[key] = value
+            except OSError:
+                pass
+            break
+
+
+# 起動時に .env を自動読み込み
+_load_env_file()
+
+
 def get_config():
     """環境変数から設定を取得する"""
     url = os.environ.get("REDMINE_URL")

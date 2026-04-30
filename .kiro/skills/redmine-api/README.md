@@ -164,19 +164,9 @@ REDMINE_API_KEY=your-api-key-here
 
 ### 3. 環境変数の読み込み
 
-bash:
-```bash
-source .env
-```
+スクリプトは起動時にワークスペースルートの `.env` ファイルを自動読み込みします。手動で `source .env` を実行する必要はありません。
 
-PowerShell:
-```powershell
-Get-Content .env | ForEach-Object {
-  if ($_ -match '^([^#].+?)=(.*)$') {
-    [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
-  }
-}
-```
+> 既に環境変数がセットされている場合は `.env` の値で上書きしません。環境変数を優先したい場合は事前に `export` してください。
 
 ### 4. セキュリティ設定（推奨）
 

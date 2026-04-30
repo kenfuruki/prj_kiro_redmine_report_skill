@@ -13,6 +13,39 @@ import urllib.error
 import urllib.parse
 
 
+def _load_env_file():
+    """ワークスペースルートの .env ファイルを自動読み込みする。"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, "..", "..", "..", "..", ".env"),
+        os.path.join(script_dir, "..", "..", "..", ".env"),
+        os.path.join(script_dir, "..", ".env"),
+        os.path.join(script_dir, ".env"),
+        os.path.join(os.getcwd(), ".env"),
+    ]
+    for env_path in candidates:
+        env_path = os.path.normpath(env_path)
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            key, _, value = line.partition("=")
+                            key = key.strip()
+                            value = value.strip()
+                            if key and not os.environ.get(key):
+                                os.environ[key] = value
+            except OSError:
+                pass
+            break
+
+
+_load_env_file()
+
+
 def get_config():
     """環境変数から設定を取得する"""
     url = os.environ.get("REDMINE_URL")
