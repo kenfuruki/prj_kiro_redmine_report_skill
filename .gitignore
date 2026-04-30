@@ -12,5 +12,8 @@ test_dashboard*.html
 __pycache__/
 *.pyc
 
+# キャッシュ
+.kiro/skills/redmine-api/cache/
+
 # 実データCSV（サンプルは除外しない）
 rpm.csv

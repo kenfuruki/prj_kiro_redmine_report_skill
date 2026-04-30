@@ -24,11 +24,54 @@ import time
 JST = timezone(timedelta(hours=9))
 
 # 対象トラッカー名（Redmineの設定に合わせて変更可能）
-TARGET_TRACKERS = ["課題", "Q/A", "サポート", "成果物", "進捗報告"]
+TARGET_TRACKERS = ["課題", "Q/A", "サポート", "成果物", "進捗報告", "バグ"]
 
 # レートリミット設定
 MAX_PROJECTS = 30        # CSVに記載できるプロジェクト数の上限
 API_SLEEP_SEC = 0.5      # APIリクエスト間のスリープ（秒）
+
+# キャッシュ設定
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cache")
+
+
+def _cache_path(name):
+    """キャッシュファイルのパスを返す（日付付き）"""
+    today_str = datetime.now(JST).strftime("%Y%m%d")
+    return os.path.join(CACHE_DIR, f"{name}_{today_str}.json")
+
+
+def _load_cache(name):
+    """同日のキャッシュがあれば読み込む。なければNone。"""
+    path = _cache_path(name)
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                print(f"キャッシュ読み込み: {name}", file=sys.stderr)
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def _save_cache(name, data):
+    """キャッシュを保存する。古い日付のキャッシュは削除する。"""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    # 古いキャッシュを削除
+    today_str = datetime.now(JST).strftime("%Y%m%d")
+    prefix = f"{name}_"
+    if os.path.isdir(CACHE_DIR):
+        for fn in os.listdir(CACHE_DIR):
+            if fn.startswith(prefix) and fn.endswith(".json") and today_str not in fn:
+                try:
+                    os.remove(os.path.join(CACHE_DIR, fn))
+                except OSError:
+                    pass
+    path = _cache_path(name)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except OSError:
+        pass
 
 # 3定点の定義
 def get_checkpoints():
@@ -104,21 +147,83 @@ def fetch_project_name(project_id):
     return project_id
 
 
-def fetch_subproject_ids(project_id):
-    """サブプロジェクトのidentifier一覧を取得する"""
+def fetch_identifier_map(custom_field_id=233):
+    """全プロジェクトを取得し、カスタムフィールド（子案件番号）→ identifier のマップを構築する。
+    同じ子案件番号が複数ある場合は parent なし（トップレベル）を優先。
+    同日のキャッシュがあればそれを使用する。
+    """
+    cached = _load_cache("identifier_map")
+    if cached is not None:
+        return cached
+    mapping = {}       # {子案件番号: identifier}
+    has_parent = {}    # {子案件番号: bool} — 既に登録済みエントリがparent付きかどうか
+    offset = 0
+    limit = 100
+    while True:
+        result = api_get(f"/projects.json?limit={limit}&offset={offset}")
+        if not result:
+            break
+        projects = result.get("projects", [])
+        for prj in projects:
+            identifier = prj.get("identifier", "")
+            custom_fields = prj.get("custom_fields", [])
+            child_no = ""
+            for cf in custom_fields:
+                if cf.get("id") == custom_field_id:
+                    child_no = cf.get("value", "")
+                    break
+            if not child_no:
+                continue
+            is_top = "parent" not in prj
+            if child_no not in mapping:
+                # 初回登録
+                mapping[child_no] = identifier
+                has_parent[child_no] = not is_top
+            elif has_parent[child_no] and is_top:
+                # 既存がparent付き → トップレベルで上書き
+                mapping[child_no] = identifier
+                has_parent[child_no] = False
+        total = result.get("total_count", 0)
+        offset += limit
+        if offset >= total:
+            break
+    _save_cache("identifier_map", mapping)
+    return mapping
+
+
+def fetch_all_subproject_ids(project_id, _visited=None):
+    """再帰的に全階層のサブプロジェクトidentifierを取得する。循環参照防止付き。同日キャッシュ対応。"""
+    if _visited is None:
+        _visited = set()
+        # トップレベル呼び出し時のみキャッシュを確認
+        cached = _load_cache(f"subprojects_{project_id}")
+        if cached is not None:
+            return cached
+    if project_id in _visited:
+        return []
+    _visited.add(project_id)
     result = api_get(f"/projects/{project_id}.json?include=children")
     if not result:
         return []
     children = result.get("project", {}).get("children", [])
-    return [c.get("identifier", str(c.get("id", ""))) for c in children if c]
+    sub_ids = []
+    for c in children:
+        cid = c.get("identifier", str(c.get("id", "")))
+        if cid and cid not in _visited:
+            sub_ids.append(cid)
+            sub_ids.extend(fetch_all_subproject_ids(cid, _visited))
+    # トップレベル呼び出し時のみキャッシュ保存（_visitedが1件=自分自身のみ）
+    if len(_visited) >= 1:
+        _save_cache(f"subprojects_{project_id}", sub_ids)
+    return sub_ids
 
 
 def fetch_all_issues_with_subprojects(project_id):
     """プロジェクトとそのサブプロジェクトの全チケットを合算して取得する"""
     # 親プロジェクトのチケット
     all_issues = fetch_all_issues(project_id)
-    # サブプロジェクトのチケット
-    sub_ids = fetch_subproject_ids(project_id)
+    # サブプロジェクトのチケット（全階層を再帰取得）
+    sub_ids = fetch_all_subproject_ids(project_id)
     for sub_id in sub_ids:
         print(f"    サブプロジェクト '{sub_id}' のチケットを取得中...", file=sys.stderr)
         sub_issues = fetch_all_issues(sub_id)
@@ -158,15 +263,16 @@ def fetch_issue_qa_count(project_id):
 
 
 def auto_extract_projects(rpm_data, existing_pids, max_projects=MAX_PROJECTS,
-                          max_extract=5, today=None):
+                          max_extract=5, today=None, identifier_map=None):
     """RPM_CSVからサービスイン予定日が操作日以降のプロジェクトを自動抽出する。
 
     処理手順:
     1. rpm_dataからサービスイン予定日が操作日以降のレコードを抽出
     2. existing_pidsに含まれるプロジェクトを除外
-    3. 各プロジェクトの課題+QAチケット総数をAPIから取得
-    4. チケット総数の降順で上位max_extract件を選出
-    5. MAX_PROJECTSを超えない範囲で件数を調整
+    3. identifier_mapが渡された場合、マップに存在しない候補をスキップ
+    4. 各プロジェクトの課題+QAチケット総数をAPIから取得
+    5. チケット総数の降順で上位max_extract件を選出
+    6. MAX_PROJECTSを超えない範囲で件数を調整
 
     Args:
         rpm_data: load_rpm_data()の戻り値（子案件Noをキーとするdict）
@@ -174,6 +280,7 @@ def auto_extract_projects(rpm_data, existing_pids, max_projects=MAX_PROJECTS,
         max_projects: プロジェクト数の上限（デフォルト: MAX_PROJECTS）
         max_extract: 自動抽出の最大件数（デフォルト: 5）
         today: テスト用の操作日注入（デフォルト: 現在日時）
+        identifier_map: {子案件番号: identifier} のマップ（Noneの場合はマップ検証をスキップ）
 
     Returns:
         自動抽出されたプロジェクトIDのリスト
@@ -212,6 +319,10 @@ def auto_extract_projects(rpm_data, existing_pids, max_projects=MAX_PROJECTS,
         if pid in existing_set:
             continue
 
+        # identifier_mapが渡された場合、マップに存在しない候補をスキップ
+        if identifier_map is not None and pid not in identifier_map:
+            continue
+
         # サービスイン予定日を取得・パース
         service_in_str = info.get("サービスイン予定日", "")
         if not service_in_str or not service_in_str.strip():
@@ -232,7 +343,9 @@ def auto_extract_projects(rpm_data, existing_pids, max_projects=MAX_PROJECTS,
     # 各候補プロジェクトのチケット数を取得
     scored = []
     for pid in candidates:
-        count = fetch_issue_qa_count(pid)
+        # identifier_mapがある場合は解決されたidentifierを使用
+        resolved_id = identifier_map.get(pid, pid) if identifier_map else pid
+        count = fetch_issue_qa_count(resolved_id)
         if count < 0:
             # Redmine上に存在しないプロジェクト → スキップ
             print(f"警告: プロジェクト '{pid}' はRedmine上に存在しないか、APIエラーが発生しました。スキップします。", file=sys.stderr)
@@ -267,13 +380,15 @@ def auto_extract_projects(rpm_data, existing_pids, max_projects=MAX_PROJECTS,
 # --- CSV読み込み ---
 
 def load_project_ids(csv_path):
-    """CSVファイルからプロジェクトidentifierとAIフラグを読み込む"""
+    """CSVファイルからプロジェクトidentifierとAIフラグ、redmine_identifierを読み込む"""
     project_ids = []
     ai_flags = {}
+    redmine_identifiers = {}
     with open(csv_path, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames or []
         has_ai_flag = any("ai" in fn.lower() for fn in fieldnames)
+        has_redmine_id = "redmine_identifier" in fieldnames
         for row in reader:
             values = list(row.values())
             pid = values[0].strip()
@@ -287,22 +402,70 @@ def load_project_ids(csv_path):
                         break
             if pid not in ai_flags:
                 ai_flags[pid] = False
-    return project_ids, ai_flags
+            # redmine_identifier列の読み込み
+            if has_redmine_id:
+                redmine_identifiers[pid] = row.get("redmine_identifier", "").strip()
+            else:
+                redmine_identifiers[pid] = ""
+    return project_ids, ai_flags, redmine_identifiers
+
+
+def _parse_rpm_date(date_str):
+    """rpm.csvの日付文字列をdateオブジェクトにパースする（複数フォーマット対応）"""
+    if not date_str or not date_str.strip():
+        return None
+    date_str = date_str.strip()
+    for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y年%m月%d日"):
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 def load_rpm_data(rpm_path):
-    """rpm.csvからプロジェクト補助データを読み込む（子案件Noをキーにする）"""
-    rpm_data = {}
+    """rpm.csvからプロジェクト補助データを読み込む（子案件Noをキーにする）。
+
+    rpm.csvは1つの子案件Noに対して工程ごとに複数レコードが存在する。
+    現在日付が開始日〜完了予定日の間にある工程を「現在工程」として採用する。
+    該当する工程がなければ最初のレコードを採用する。
+    全工程の情報は rpm_phases として別途保持する。
+    """
+    rpm_data = {}       # {子案件No: 現在工程のレコードdict}
+    rpm_phases = {}     # {子案件No: [全工程レコードのリスト]}
     if not rpm_path or not os.path.exists(rpm_path):
-        return rpm_data
+        return rpm_data, rpm_phases
+
+    today = datetime.now(JST).date()
+    all_rows = {}  # {子案件No: [row, ...]}
+
     with open(rpm_path, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             pid = row.get("子案件No", "").strip()
             if not pid:
                 continue
-            rpm_data[pid] = {k: v.strip() if v else "" for k, v in row.items()}
-    return rpm_data
+            cleaned = {k: v.strip() if v else "" for k, v in row.items()}
+            if pid not in all_rows:
+                all_rows[pid] = []
+            all_rows[pid].append(cleaned)
+
+    for pid, rows in all_rows.items():
+        rpm_phases[pid] = rows
+        # 現在工程の判定: 開始日 <= today <= 完了予定日
+        current_phase = None
+        for row in rows:
+            start = _parse_rpm_date(row.get("開始日", ""))
+            end = _parse_rpm_date(row.get("完了予定日", ""))
+            if start and end and start <= today <= end:
+                current_phase = row
+                break
+        if current_phase is None:
+            # 該当なし → 最初のレコードを採用
+            current_phase = rows[0]
+        rpm_data[pid] = current_phase
+
+    return rpm_data, rpm_phases
 
 
 # --- 状態復元 ---
@@ -373,11 +536,16 @@ def get_done_ratio_at(issue, target_dt):
 # --- ステータスID→名前マッピング ---
 
 def fetch_status_map():
-    """ステータスIDと名前のマッピングを取得する"""
+    """ステータスIDと名前のマッピングを取得する（同日キャッシュ対応）"""
+    cached = _load_cache("status_map")
+    if cached is not None:
+        return cached
     result = api_get("/issue_statuses.json")
     if not result:
         return {}
-    return {str(s["id"]): s["name"] for s in result.get("issue_statuses", [])}
+    mapping = {str(s["id"]): s["name"] for s in result.get("issue_statuses", [])}
+    _save_cache("status_map", mapping)
+    return mapping
 
 
 def resolve_status_name(status_str, status_map):
@@ -702,41 +870,43 @@ def _render_tracker_table(tracker_name, stats, checkpoint_labels, checkpoint_dat
 
 
 def _render_deliverable_table(deliverable_data, checkpoint_labels, checkpoint_dates):
-    """成果物のサマリーバー + ガントチャート風タイムラインHTMLを生成する"""
+    """成果物のサマリーバー + コンパクトテーブル + ガント（遅延・進行中の上位10件）を生成する"""
     if not deliverable_data:
         return ""
     today = datetime.now(JST).date()
+    GANTT_MAX = 10
+    NAME_MAX = 20
     parts = ['<div class="sec"><h3>成果物 — 予実管理</h3>']
 
-    # サマリー集計
-    completed = 0
-    in_progress = 0
-    overdue = 0
-    no_due = 0
+    # 分類
+    completed_list = []
+    in_progress_list = []
+    overdue_list = []
+    no_due_list = []
     for d in deliverable_data:
         done = d.get("done_ratio", 0)
         due = d.get("due_date")
         if done >= 100:
-            completed += 1
+            completed_list.append(d)
         elif due:
             try:
-                if datetime.strptime(due, "%Y-%m-%d").date() < today and done < 100:
-                    overdue += 1
+                if datetime.strptime(due, "%Y-%m-%d").date() < today:
+                    overdue_list.append(d)
                 else:
-                    in_progress += 1
+                    in_progress_list.append(d)
             except ValueError:
-                in_progress += 1
+                in_progress_list.append(d)
         else:
-            no_due += 1
+            no_due_list.append(d)
     total = len(deliverable_data)
 
     # サマリーバー
     parts.append('<div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">')
     bar_items = [
-        (completed, "完了", "var(--c-ok1)"),
-        (in_progress, "進行中", "var(--c-b6)"),
-        (overdue, "遅延", "#B40000"),
-        (no_due, "期日未設定", "var(--c-g3)"),
+        (len(completed_list), "完了", "var(--c-ok1)"),
+        (len(in_progress_list), "進行中", "var(--c-b6)"),
+        (len(overdue_list), "遅延", "#B40000"),
+        (len(no_due_list), "期日未設定", "var(--c-g3)"),
     ]
     for count, label, color in bar_items:
         if count == 0:
@@ -758,19 +928,58 @@ def _render_deliverable_table(deliverable_data, checkpoint_labels, checkpoint_da
             parts.append(f'<div style="width:{pct:.1f}%;background:{color};"></div>')
         parts.append('</div>')
 
-    # ガントチャート用の日付範囲を計算
-    dated_items = []
-    undated_items = []
-    for d in deliverable_data:
-        if d.get("due_date"):
-            dated_items.append(d)
+    # コンパクトテーブル（全成果物）
+    parts.append('<table style="font:var(--fw) 13px/1.3 var(--ff);margin-bottom:16px;"><thead><tr>')
+    parts.append('<th class="tp" style="text-align:left;">ID</th>')
+    parts.append('<th class="tp" style="text-align:left;">成果物名</th>')
+    parts.append('<th class="tp">進捗率</th>')
+    parts.append('<th class="tp">期日</th>')
+    parts.append('<th class="tp">判定</th>')
+    parts.append('</tr></thead><tbody>')
+    for d in sorted(deliverable_data, key=lambda x: (0 if x in overdue_list else 1 if x in in_progress_list else 2 if x in no_due_list else 3, x.get("due_date") or "9999")):
+        done = d.get("done_ratio", 0)
+        due = d.get("due_date", "")
+        subj = d.get("subject", "")
+        short_subj = subj[:NAME_MAX] + ("…" if len(subj) > NAME_MAX else "")
+        is_overdue = d in overdue_list
+        is_done = d in completed_list
+        # 進捗率バー
+        if done >= 100:
+            bar_color = "var(--c-ok1)"
+        elif is_overdue:
+            bar_color = "#B40000"
+        elif done > 0:
+            bar_color = "var(--c-b6)"
         else:
-            undated_items.append(d)
+            bar_color = "var(--c-g3)"
+        progress_bar = (
+            f'<div style="display:flex;align-items:center;gap:4px;">'
+            f'<div style="flex:1;height:10px;background:var(--c-g2);border-radius:3px;overflow:hidden;">'
+            f'<div style="width:{done}%;height:100%;background:{bar_color};border-radius:3px;"></div></div>'
+            f'<span style="min-width:32px;text-align:right;">{done}%</span></div>')
+        # 判定
+        if is_done:
+            verdict = '<span style="color:var(--c-ok2);">✅ 完了</span>'
+        elif is_overdue:
+            verdict = '<span style="color:#B40000;font-weight:var(--fb);">⚠ 遅延</span>'
+        elif due:
+            verdict = '<span style="color:var(--c-b6);">🔄 進行中</span>'
+        else:
+            verdict = '<span style="color:var(--c-g5);">📋 期日未設定</span>'
+        due_style = ' style="color:#B40000;font-weight:var(--fb);"' if is_overdue else ""
+        parts.append(f'<tr><td>#{d["id"]}</td>')
+        parts.append(f'<td style="text-align:left;" title="{subj}">{short_subj}</td>')
+        parts.append(f'<td>{progress_bar}</td>')
+        parts.append(f'<td{due_style}>{due or "-"}</td>')
+        parts.append(f'<td>{verdict}</td></tr>')
+    parts.append('</tbody></table>')
 
-    if dated_items:
-        # タイムライン範囲: 最も古い作成日〜最も遠い期日（+余白）
+    # ガントチャート（遅延 + 進行中の上位GANTT_MAX件のみ）
+    gantt_candidates = overdue_list + in_progress_list
+    gantt_items = [d for d in gantt_candidates if d.get("due_date")][:GANTT_MAX]
+    if gantt_items:
         all_dues = []
-        for d in dated_items:
+        for d in gantt_items:
             try:
                 all_dues.append(datetime.strptime(d["due_date"], "%Y-%m-%d").date())
             except ValueError:
@@ -782,23 +991,23 @@ def _render_deliverable_table(deliverable_data, checkpoint_labels, checkpoint_da
             if timeline_days < 1:
                 timeline_days = 1
 
-            # SVGガントチャート
+            gantt_label = f"注目成果物（遅延・進行中 上位{len(gantt_items)}件）"
+            parts.append(f'<p style="font:var(--fb) 13px/1.3 var(--ff);color:var(--c-g7);margin-bottom:8px;">{gantt_label}</p>')
+
             row_h = 32
-            pad_l = 200
+            pad_l = 180
             pad_r = 20
             pad_t = 30
             chart_w = 560
             bar_area_w = chart_w - pad_l - pad_r
-            svg_h = pad_t + len(dated_items) * row_h + 20
+            svg_h = pad_t + len(gantt_items) * row_h + 20
 
             parts.append(f'<svg viewBox="0 0 {chart_w} {svg_h}" style="width:100%;max-width:{chart_w}px;height:auto;" role="img" aria-label="成果物ガントチャート">')
 
-            # 今日の線
             today_x = pad_l + (today - timeline_start).days / timeline_days * bar_area_w
             parts.append(f'<line x1="{today_x:.1f}" y1="{pad_t-10}" x2="{today_x:.1f}" y2="{svg_h-10}" stroke="#B40000" stroke-width="1.5" stroke-dasharray="4,3"/>')
             parts.append(f'<text x="{today_x:.1f}" y="{pad_t-14}" text-anchor="middle" font-size="10" fill="#B40000" font-family="\'Noto Sans JP\',sans-serif">今日</text>')
 
-            # 月の区切り線とラベル
             d_cursor = timeline_start.replace(day=1)
             while d_cursor <= timeline_end:
                 if d_cursor >= timeline_start:
@@ -810,55 +1019,32 @@ def _render_deliverable_table(deliverable_data, checkpoint_labels, checkpoint_da
                 else:
                     d_cursor = d_cursor.replace(month=d_cursor.month+1)
 
-            # 各成果物のバー
-            for idx, d in enumerate(sorted(dated_items, key=lambda x: x.get("due_date", "9999"))):
+            for idx, d in enumerate(sorted(gantt_items, key=lambda x: x.get("due_date", "9999"))):
                 y = pad_t + idx * row_h
                 done = d.get("done_ratio", 0)
                 due_str = d.get("due_date", "")
-                subject = d.get("subject", "")[:18]
+                subject = d.get("subject", "")[:16]
                 try:
                     due_date = datetime.strptime(due_str, "%Y-%m-%d").date()
                 except ValueError:
                     continue
                 is_overdue = due_date < today and done < 100
-
-                # ラベル
                 label_color = "#B40000" if is_overdue else "#3D454D"
-                parts.append(f'<text x="{pad_l-6}" y="{y+20}" text-anchor="end" font-size="11" fill="{label_color}" font-family="\'Noto Sans JP\',sans-serif">#{d["id"]} {subject}</text>')
-
-                # 予定バー（作成日〜期日）
+                parts.append(f'<text x="{pad_l-6}" y="{y+20}" text-anchor="end" font-size="10" fill="{label_color}" font-family="\'Noto Sans JP\',sans-serif">#{d["id"]} {subject}</text>')
                 bar_start_x = pad_l
                 bar_end_x = pad_l + (due_date - timeline_start).days / timeline_days * bar_area_w
                 bar_w = max(bar_end_x - bar_start_x, 4)
                 parts.append(f'<rect x="{bar_start_x:.1f}" y="{y+10}" width="{bar_w:.1f}" height="14" fill="#D9DCE2" rx="3"><title>予定: 〜{due_str}</title></rect>')
-
-                # 実績バー（進捗率分）
                 actual_w = bar_w * done / 100
-                if done >= 100:
-                    fill = "var(--c-ok1)"
-                elif is_overdue:
-                    fill = "#B40000"
-                else:
-                    fill = "var(--c-b6)"
+                fill = "#B40000" if is_overdue else "var(--c-b6)"
                 if actual_w > 0:
                     parts.append(f'<rect x="{bar_start_x:.1f}" y="{y+10}" width="{actual_w:.1f}" height="14" fill="{fill}" rx="3"><title>実績: {done}%</title></rect>')
-
-                # 進捗率ラベル
                 label_x = bar_start_x + bar_w + 4
                 parts.append(f'<text x="{label_x:.1f}" y="{y+21}" font-size="10" fill="{label_color}" font-weight="700" font-family="\'Noto Sans JP\',sans-serif">{done}%</text>')
-
-                # 期日マーカー
                 due_x = bar_end_x
                 parts.append(f'<line x1="{due_x:.1f}" y1="{y+8}" x2="{due_x:.1f}" y2="{y+26}" stroke="{label_color}" stroke-width="1.5"/>')
 
             parts.append('</svg>')
-
-    # 期日未設定の成果物
-    if undated_items:
-        parts.append('<div style="margin-top:12px;font:var(--fw) 14px/1.3 var(--ff);color:var(--c-g5);">')
-        parts.append('<strong>期日未設定:</strong> ')
-        items_str = ", ".join(f'#{d["id"]} {d.get("subject","")}' for d in undated_items)
-        parts.append(f'{items_str}</div>')
 
     parts.append('</div>')
     return "\n".join(parts)
@@ -901,7 +1087,7 @@ def _get_latest_progress_report(issues):
 
 
 def _render_progress_report(issues):
-    """最新の進捗報告セクションHTMLを生成する"""
+    """最新の進捗報告セクションHTMLを生成する（アコーディオン方式）"""
     report, _ = _get_latest_progress_report(issues)
     if not report or not report["text"]:
         return ""
@@ -913,23 +1099,28 @@ def _render_progress_report(issues):
     full_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>") if truncated else ""
 
     uid = f"progress-{report['id']}"
+    btn_style = ("font:var(--fb) 12px/1 var(--ff);color:var(--c-b7);background:none;border:none;"
+                 "cursor:pointer;text-decoration:underline;margin-top:4px;")
     parts = [
         '<div class="sec"><h3>📋 プロマネ報告（最新の進捗報告）</h3>',
         f'<p style="font:var(--fw) 12px/1.3 var(--ff);color:var(--c-g5);margin-bottom:8px;">'
         f'#{report["id"]} {report["subject"]} ｜ {report["author"]} ｜ {report["date"]}</p>',
         f'<div style="font:var(--fw) 14px/1.7 var(--ff);color:var(--c-g7);background:var(--c-g50);'
         f'border-radius:var(--r);padding:12px;border-left:3px solid var(--c-g3);">',
-        f'<span id="{uid}-short">{display_text}',
     ]
     if truncated:
         parts.append(
+            f'<div id="{uid}-short">{display_text}…'
             f'<br><button onclick="document.getElementById(\'{uid}-short\').style.display=\'none\';'
-            f'document.getElementById(\'{uid}-full\').style.display=\'inline\';" '
-            f'style="font:var(--fb) 12px/1 var(--ff);color:var(--c-b7);background:none;border:none;'
-            f'cursor:pointer;text-decoration:underline;margin-top:4px;">続きを読む</button>')
-        parts.append(f'</span><span id="{uid}-full" style="display:none;">{full_text}</span>')
+            f'document.getElementById(\'{uid}-full\').style.display=\'block\';" '
+            f'style="{btn_style}">▼ 全文を表示</button></div>')
+        parts.append(
+            f'<div id="{uid}-full" style="display:none;">{full_text}'
+            f'<br><button onclick="document.getElementById(\'{uid}-full\').style.display=\'none\';'
+            f'document.getElementById(\'{uid}-short\').style.display=\'block\';" '
+            f'style="{btn_style}">▲ 短縮表示</button></div>')
     else:
-        parts.append('</span>')
+        parts.append(f'<div>{display_text}</div>')
     parts.append('</div></div>')
     return "\n".join(parts)
 
@@ -1241,6 +1432,43 @@ def _render_filter_sort_js():
     updateIndicators();
   }
 })();
+
+// フィルタボタン
+(function(){
+  var btns = document.querySelectorAll('.filter-btn');
+  if (!btns.length) return;
+  var tbody = document.querySelector('#project-list-table tbody');
+  if (!tbody) return;
+
+  function applyBtnFilter(filter) {
+    var rows = tbody.querySelectorAll('tr');
+    for (var i = 0; i < rows.length; i++) {
+      var show = true;
+      if (filter === 'risk') show = rows[i].getAttribute('data-risk') === '1';
+      else if (filter === 'ai') show = rows[i].getAttribute('data-ai') === '1';
+      else if (filter === 'csv') show = rows[i].getAttribute('data-auto') !== '1';
+      rows[i].style.display = show ? '' : 'none';
+    }
+  }
+
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].addEventListener('click', function(e) {
+      e.stopPropagation();
+      for (var j = 0; j < btns.length; j++) {
+        btns[j].classList.remove('active');
+        btns[j].style.background = '';
+        btns[j].style.color = '';
+      }
+      this.classList.add('active');
+      this.style.background = '#005FC6';
+      this.style.color = '#FFF';
+      applyBtnFilter(this.getAttribute('data-filter'));
+    });
+  }
+  // 初期状態: 全件ボタンをアクティブに
+  btns[0].style.background = '#005FC6';
+  btns[0].style.color = '#FFF';
+})();
 """
 
 
@@ -1298,6 +1526,113 @@ def _render_trend_chart(tracker_name, stats, checkpoint_labels, checkpoint_dates
     lx = pad_l + len(tracker_name) * 12 + 40
     svg.append(f'<line x1="{lx}" y1="{pad_t-16}" x2="{lx+20}" y2="{pad_t-16}" stroke="#259D63" stroke-width="2.5"/>')
     svg.append(f'<text x="{lx+24}" y="{pad_t-12}" font-size="10" fill="#3D454D" font-family="\'Noto Sans JP\',sans-serif">解決・終了</text>')
+
+    svg.append('</svg>')
+    return f'<div style="margin-bottom:16px;">{"".join(svg)}</div>'
+
+
+# バグフェーズ分類用キーワードと色（ステアリングのフェーズコードに準拠）
+BUG_PHASE_CONFIG = [
+    ("05_PS", "#8DC8FF"),   # Blue-300 — 製造・単体テスト
+    ("06_IT", "#0072EF"),   # Blue-600 — 結合テスト
+    ("07_ST", "#F09000"),   # Warning-1 — システムテスト
+    ("08_UAT", "#259D63"),  # Success-1 — ユーザー受入テスト
+    ("09_OT", "#6B7682"),   # Gray-536 — 運用テスト・移行
+]
+
+
+def _render_bug_phase_chart(issues, checkpoints):
+    """バグチケットをバージョン（フェーズ）別に分類し、4定点の折れ線グラフを生成する。
+
+    バージョン名（fixed_version.name）に IT/ST/UAT を含むかで分類。
+    どれにも該当しないバグは「その他」として集計。
+    """
+    checkpoint_labels = [c[0] for c in checkpoints]
+    checkpoint_dates = [c[1].strftime("%m/%d") for c in checkpoints]
+
+    # バグチケットのみ抽出
+    bug_issues = [i for i in issues if i.get("tracker", {}).get("name") == "バグ"]
+    if not bug_issues:
+        return ""
+
+    # フェーズ分類関数
+    def classify_phase(issue):
+        ver = issue.get("fixed_version", {})
+        ver_name = ver.get("name", "") if ver else ""
+        for keyword, _ in BUG_PHASE_CONFIG:
+            if ver_name.startswith(keyword) or keyword in ver_name.upper():
+                return keyword
+        return "その他"
+
+    # 各フェーズ×各定点のチケット数を集計
+    phases = [p[0] for p in BUG_PHASE_CONFIG] + ["その他"]
+    phase_colors = {p[0]: p[1] for p in BUG_PHASE_CONFIG}
+    phase_colors["その他"] = "#B4BAC5"  # Gray-300
+
+    series = {phase: [] for phase in phases}
+    for _label, cp_dt in checkpoints:
+        counts = {phase: 0 for phase in phases}
+        for issue in bug_issues:
+            status = get_status_at(issue, cp_dt)
+            if status is None:
+                continue
+            phase = classify_phase(issue)
+            counts[phase] += 1
+        for phase in phases:
+            series[phase].append(counts[phase])
+
+    # データがあるフェーズのみ
+    active_phases = [p for p in phases if any(v > 0 for v in series[p])]
+    if not active_phases:
+        return ""
+
+    all_vals = [v for p in active_phases for v in series[p]]
+    max_val = max(all_vals) if all_vals else 0
+    if max_val == 0:
+        return ""
+
+    w, h = 560, 240
+    pad_l, pad_r, pad_t, pad_b = 40, 20, 30, 50
+    chart_w = w - pad_l - pad_r
+    chart_h = h - pad_t - pad_b
+    n_points = len(checkpoint_labels)
+    gap = chart_w / (n_points - 1) if n_points > 1 else 0
+
+    svg = [f'<svg viewBox="0 0 {w} {h}" style="width:100%;max-width:{w}px;height:auto;" role="img" aria-label="バグ フェーズ別推移グラフ">']
+
+    for i in range(5):
+        y = pad_t + chart_h - (chart_h * i / 4)
+        val = int(max_val * i / 4)
+        svg.append(f'<line x1="{pad_l}" y1="{y}" x2="{w-pad_r}" y2="{y}" stroke="#D9DCE2" stroke-width="1"/>')
+        svg.append(f'<text x="{pad_l-6}" y="{y+4}" text-anchor="end" font-size="11" fill="#6B7682" font-family="\'Noto Sans JP\',sans-serif">{val}</text>')
+
+    for phase in active_phases:
+        color = phase_colors[phase]
+        counts = series[phase]
+        points = []
+        for idx, val in enumerate(counts):
+            x = pad_l + gap * idx
+            y = pad_t + chart_h - (val / max_val * chart_h) if max_val > 0 else pad_t + chart_h
+            points.append((x, y, val))
+        line_points = " ".join(f"{p[0]:.1f},{p[1]:.1f}" for p in points)
+        svg.append(f'<polyline points="{line_points}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round"/>')
+        for x, y, val in points:
+            svg.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="{color}" stroke="#FFF" stroke-width="1.5"><title>{phase}: {val}件</title></circle>')
+            svg.append(f'<text x="{x:.1f}" y="{y-10:.1f}" text-anchor="middle" font-size="11" fill="{color}" font-weight="700" font-family="\'Noto Sans JP\',sans-serif">{val}</text>')
+
+    # X軸ラベル
+    for idx, (label, date_str) in enumerate(zip(checkpoint_labels, checkpoint_dates)):
+        x = pad_l + gap * idx
+        svg.append(f'<text x="{x:.1f}" y="{h-pad_b+16}" text-anchor="middle" font-size="12" fill="#3D454D" font-family="\'Noto Sans JP\',sans-serif">{label}</text>')
+        svg.append(f'<text x="{x:.1f}" y="{h-pad_b+30}" text-anchor="middle" font-size="10" fill="#6B7682" font-family="\'Noto Sans JP\',sans-serif">({date_str})</text>')
+
+    # 凡例
+    lx = pad_l
+    for phase in active_phases:
+        color = phase_colors[phase]
+        svg.append(f'<line x1="{lx}" y1="{pad_t-16}" x2="{lx+20}" y2="{pad_t-16}" stroke="{color}" stroke-width="2.5"/>')
+        svg.append(f'<text x="{lx+24}" y="{pad_t-12}" font-size="10" fill="#3D454D" font-family="\'Noto Sans JP\',sans-serif">{phase}</text>')
+        lx += len(phase) * 12 + 34
 
     svg.append('</svg>')
     return f'<div style="margin-bottom:16px;">{"".join(svg)}</div>'
@@ -1389,8 +1724,16 @@ th{font-weight:var(--fb);background:var(--c-g1);color:var(--c-g7)}
                 ai_cnt += 1
     h.append('<div id="page-list" class="page active">')
     h.append('<section class="sec"><h2>プロジェクト一覧</h2>')
+    # フィルタボタン
+    h.append('<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">')
+    btn_base = 'style="padding:6px 14px;border-radius:var(--rs);font:var(--fb) 13px/1 var(--ff);cursor:pointer;border:1px solid var(--c-g3);transition:background .15s;"'
+    h.append(f'<button class="filter-btn active" data-filter="all" {btn_base}>全件</button>')
+    h.append(f'<button class="filter-btn" data-filter="risk" {btn_base}>⚠ 期限リスク</button>')
+    h.append(f'<button class="filter-btn" data-filter="ai" {btn_base}>🤖 AI対象</button>')
+    h.append(f'<button class="filter-btn" data-filter="csv" {btn_base}>📋 CSV指定のみ</button>')
+    h.append('</div>')
     # テーブルヘッダー
-    tracker_cols = ["課題", "Q/A", "サポート", "成果物"]
+    tracker_cols = ["課題", "Q/A", "サポート", "成果物", "バグ"]
     has_rpm = bool(rpm_data)
     h.append('<table id="project-list-table"><thead><tr>')
     h.append('<th class="tp" style="text-align:left;">プロジェクト</th>')
@@ -1432,7 +1775,7 @@ th{font-weight:var(--fb);background:var(--c-g1);color:var(--c-g7)}
             scores_list = risk_scores.get(pid, [0, 0, 0, 0])
             trend_str = '→'.join(str(s) for s in scores_list)
             risk_badge = f' <span style="display:inline-block;font-size:11px;padding:1px 6px;border-radius:var(--rs);background:#FFF3E0;color:#B40000;font-weight:var(--fb);margin-left:4px;" title="Risk_Score推移: {trend_str}">⚠ 期限リスク</span>'
-        h.append(f'<tr data-original-index="{row_idx}" style="cursor:pointer;" tabindex="0" role="button" aria-label="プロジェクト {pid} の詳細を表示" onclick="go(\'{pid}\')" onkeydown="if(event.key===\'Enter\')go(\'{pid}\')">')
+        h.append(f'<tr data-original-index="{row_idx}" data-risk="{"1" if deadline_risk.get(pid) else "0"}" data-ai="{"1" if pid in ai_enabled_pids else "0"}" data-auto="{"1" if pid in auto_extracted else "0"}" style="cursor:pointer;" tabindex="0" role="button" aria-label="プロジェクト {pid} の詳細を表示" onclick="go(\'{pid}\')" onkeydown="if(event.key===\'Enter\')go(\'{pid}\')">')
         h.append(f'<td style="text-align:left;"><strong style="color:var(--c-b7);">{pname}</strong>{auto_badge}{risk_badge}<br><span style="font-size:12px;color:var(--c-g5);">{pid}</span></td>')
         if has_rpm:
             h.append(f'<td>{rpm.get("影響度区分", "-")}</td>')
@@ -1506,11 +1849,26 @@ th{font-weight:var(--fb);background:var(--c-g1);color:var(--c-g7)}
         # AI考察（ai_targetsセットベース）
         if pid in ai_enabled_pids:
             h.append(_render_ai_placeholder(pid, pname, projects_issues.get(pid, []), ps, rpm_data.get(pid), risk_scores=risk_scores, deadline_risk=deadline_risk))
-        # 折れ線グラフ（課題・Q/A・サポート）
+        # 折れ線グラフ（課題・Q/A・サポート + バグフェーズ別）— 2行2列グリッド
+        chart_items = []
         for tn in ["課題", "Q/A", "サポート"]:
             chart_html = _render_trend_chart(tn, ps.get(tn, {}), checkpoint_labels, checkpoint_dates)
             if chart_html:
-                h.append(f'<div class="sec"><h3>{tn} — 合計数と解決・終了数の推移</h3>{chart_html}</div>')
+                chart_items.append(f'<div><h3 style="font:var(--fb) 16px/1.5 var(--ff);color:var(--c-g8);margin-bottom:8px;">{tn} — 合計数と解決・終了数</h3>{chart_html}</div>')
+        # バグはフェーズ別グラフ
+        bug_chart = _render_bug_phase_chart(projects_issues.get(pid, []), checkpoints)
+        if bug_chart:
+            chart_items.append(f'<div><h3 style="font:var(--fb) 16px/1.5 var(--ff);color:var(--c-g8);margin-bottom:8px;">バグ — フェーズ別推移</h3>{bug_chart}</div>')
+        elif ps.get("バグ"):
+            # フェーズ情報がない場合は通常の折れ線
+            chart_html = _render_trend_chart("バグ", ps.get("バグ", {}), checkpoint_labels, checkpoint_dates)
+            if chart_html:
+                chart_items.append(f'<div><h3 style="font:var(--fb) 16px/1.5 var(--ff);color:var(--c-g8);margin-bottom:8px;">バグ — 合計数と解決・終了数</h3>{chart_html}</div>')
+        if chart_items:
+            h.append('<div class="sec" style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;">')
+            for item in chart_items:
+                h.append(item)
+            h.append('</div>')
         h.append(_render_deliverable_table(pd, checkpoint_labels, checkpoint_dates))
         h.append('</section></div>')
 
@@ -1532,7 +1890,7 @@ def main():
 
     # CSV読み込み
     print(f"CSVファイル読み込み: {args.csv}", file=sys.stderr)
-    project_ids, ai_flags = load_project_ids(args.csv)
+    project_ids, ai_flags, redmine_identifiers = load_project_ids(args.csv)
     if not project_ids:
         print("エラー: CSVからプロジェクトIDが読み込めませんでした。", file=sys.stderr)
         sys.exit(1)
@@ -1544,18 +1902,49 @@ def main():
 
     # rpm.csv読み込み
     rpm_data = {}
+    rpm_phases = {}
     if args.rpm:
         print(f"rpm.csv読み込み: {args.rpm}", file=sys.stderr)
-        rpm_data = load_rpm_data(args.rpm)
+        rpm_data, rpm_phases = load_rpm_data(args.rpm)
         print(f"  → {len(rpm_data)}件のプロジェクト補助データを取得", file=sys.stderr)
+
+    # 子案件番号 → identifier マップ構築
+    print("子案件番号 → identifier マップを構築中...", file=sys.stderr)
+    identifier_map = fetch_identifier_map()
+    print(f"  → {len(identifier_map)}件のマッピングを取得", file=sys.stderr)
+
+    # 各プロジェクトの識別子を解決
+    resolved_ids = {}  # {pid(子案件番号): resolved_identifier}
+    skipped = []
+    for pid in project_ids:
+        if redmine_identifiers.get(pid):
+            # CSV直接指定のredmine_identifierを優先
+            resolved_ids[pid] = redmine_identifiers[pid]
+            print(f"  {pid} → {redmine_identifiers[pid]}（CSV直接指定）", file=sys.stderr)
+        elif pid in identifier_map:
+            # マップから解決
+            resolved_ids[pid] = identifier_map[pid]
+            print(f"  {pid} → {identifier_map[pid]}（マップ解決）", file=sys.stderr)
+        else:
+            # どちらもなければスキップ
+            print(f"警告: プロジェクト '{pid}' のRedmine identifierが解決できません。スキップします。", file=sys.stderr)
+            skipped.append(pid)
+
+    # スキップされたプロジェクトを除外
+    for pid in skipped:
+        project_ids.remove(pid)
 
     # 自動抽出処理（--rpm指定時のみ）
     auto_extracted = set()
     if args.rpm and rpm_data:
-        extracted_pids = auto_extract_projects(rpm_data, project_ids)
+        extracted_pids = auto_extract_projects(rpm_data, project_ids, identifier_map=identifier_map)
         for pid in extracted_pids:
+            # 自動抽出されたプロジェクトのidentifierも解決
+            resolved_id = identifier_map.get(pid, pid)
+            resolved_ids[pid] = resolved_id
             project_ids.append(pid)
             ai_flags[pid] = False
+            redmine_identifiers[pid] = ""
             auto_extracted.add(pid)
 
     # ステータスマッピング取得
@@ -1566,9 +1955,10 @@ def main():
     projects_issues = {}
     project_names = {}
     for pid in project_ids:
-        print(f"プロジェクト '{pid}' のチケットを取得中...", file=sys.stderr)
-        project_names[pid] = fetch_project_name(pid)
-        issues = fetch_all_issues_with_subprojects(pid)
+        resolved_id = resolved_ids.get(pid, pid)
+        print(f"プロジェクト '{pid}' (identifier: {resolved_id}) のチケットを取得中...", file=sys.stderr)
+        project_names[pid] = fetch_project_name(resolved_id)
+        issues = fetch_all_issues_with_subprojects(resolved_id)
         projects_issues[pid] = issues
         print(f"  → {project_names[pid]}: {len(issues)}件取得（サブプロジェクト含む）", file=sys.stderr)
 

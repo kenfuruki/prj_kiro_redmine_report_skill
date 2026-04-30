@@ -156,8 +156,50 @@ def build_mock_data():
         "・CSVエクスポートのエンコーディング問題が新たに発生。調査開始済み。\n"
         "【リスク】\n"
         "・テスト計画書の遅延がテストフェーズ全体に影響する可能性あり。\n"
-        "・検索機能の性能問題は未着手。優先度の見直しが必要。"
+        "・検索機能の性能問題は未着手。優先度の見直しが必要。\n"
+        "【詳細状況】\n"
+        "・基本設計書はレビュー指摘事項の反映が残っており、レビュアーとの調整を進めている。\n"
+        "・テスト計画書については、テスト対象範囲の見直しが必要との指摘があり、再検討中。\n"
+        "・CSVエクスポートの問題は文字コードの変換処理に起因しており、ライブラリの更新で対応予定。\n"
+        "・来週はレビュー会議を2回予定しており、基本設計書の完了を目指す。\n"
+        "・テスト計画書のリカバリーについては、外部リソースの投入を上長に相談済み。回答待ち。\n"
+        "【来週の予定】\n"
+        "・基本設計書レビュー会議（5/1, 5/3）\n"
+        "・テスト計画書リカバリープラン策定\n"
+        "・CSVエクスポート修正・単体テスト\n"
+        "・検索機能の性能調査着手判断"
     )
+
+    # バグチケット（フェーズ別: IT/ST/UAT）
+    bug_issues_alpha = [
+        make_issue(1001, "バグ", "IT: ログイン時にセッションが切れる", 2, "進行中",
+                   created_days_ago=20,
+                   journals=[make_journal(15, status_old=1, status_new=2)]),
+        make_issue(1002, "バグ", "IT: 一覧画面のページネーション不具合", 3, "解決",
+                   created_days_ago=18,
+                   journals=[make_journal(14, status_old=1, status_new=2), make_journal(8, status_old=2, status_new=3)]),
+        make_issue(1003, "バグ", "IT: CSVダウンロードで文字化け", 1, "新規",
+                   created_days_ago=5),
+        make_issue(1004, "バグ", "ST: 帳票出力の合計値が不正", 2, "進行中",
+                   created_days_ago=12,
+                   journals=[make_journal(10, status_old=1, status_new=2)]),
+        make_issue(1005, "バグ", "ST: 検索条件のAND/OR動作が逆", 1, "新規",
+                   created_days_ago=6),
+        make_issue(1006, "バグ", "ST: 日付入力のバリデーション漏れ", 1, "新規",
+                   created_days_ago=3),
+        make_issue(1007, "バグ", "UAT: 承認フローで差し戻しが効かない", 1, "新規",
+                   created_days_ago=2),
+    ]
+    # fixed_versionを設定
+    for bug in bug_issues_alpha:
+        subj = bug["subject"]
+        if subj.startswith("IT:"):
+            bug["fixed_version"] = {"id": 10, "name": "06_IT"}
+        elif subj.startswith("ST:"):
+            bug["fixed_version"] = {"id": 11, "name": "07_ST"}
+        elif subj.startswith("UAT:"):
+            bug["fixed_version"] = {"id": 12, "name": "08_UAT"}
+    alpha_issues.extend(bug_issues_alpha)
 
     # --- プロジェクト prj-beta ---
     beta_issues = [
