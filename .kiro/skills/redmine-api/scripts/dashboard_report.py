@@ -423,10 +423,33 @@ def _parse_rpm_date(date_str):
     return None
 
 
+def _parse_rpm_yearmonth(ym_str):
+    """着手年月（YYYY/MM形式等）をdateオブジェクト（月初日）にパースする"""
+    if not ym_str or not ym_str.strip():
+        return None
+    ym_str = ym_str.strip()
+    for fmt in ("%Y/%m", "%Y-%m", "%Y年%m月"):
+        try:
+            return datetime.strptime(ym_str, fmt).date()
+        except ValueError:
+            continue
+    # YYYY/MM/DD形式の場合は月初に変換
+    d = _parse_rpm_date(ym_str)
+    if d:
+        return d.replace(day=1)
+    return None
+
+
 def load_rpm_data(rpm_path):
     """rpm.csvからプロジェクト補助データを読み込む（子案件Noをキーにする）。
 
     rpm.csvは1つの子案件Noに対して工程ごとに複数レコードが存在する。
+
+    事前フィルタ:
+    - 作業日（今日） < サービスイン予定日（まだサービスインしていない）
+    - 作業日（今日） ≧ 着手年月（既に着手している）
+    両方を満たす子案件Noの全工程レコードのみ読み込む。
+
     現在日付が開始日〜完了予定日の間にある工程を「現在工程」として採用する。
     該当する工程がなければ最初のレコードを採用する。
     全工程の情報は rpm_phases として別途保持する。
@@ -450,7 +473,36 @@ def load_rpm_data(rpm_path):
                 all_rows[pid] = []
             all_rows[pid].append(cleaned)
 
+    # 事前フィルタ: 子案件No単位で条件判定（いずれかのレコードで条件を満たせばOK）
+    filtered_pids = set()
+    skipped_count = 0
     for pid, rows in all_rows.items():
+        # サービスイン予定日: いずれかのレコードから取得（最初に見つかった有効な値）
+        service_in = None
+        start_ym = None
+        for row in rows:
+            if not service_in:
+                service_in = _parse_rpm_date(row.get("サービスイン予定日", ""))
+            if not start_ym:
+                start_ym = _parse_rpm_yearmonth(row.get("着手年月", ""))
+
+        # 条件判定
+        # 条件1: 作業日 < サービスイン予定日（まだサービスインしていない）
+        if service_in and today >= service_in:
+            skipped_count += 1
+            continue
+        # 条件2: 作業日 ≧ 着手年月（既に着手している）
+        if start_ym and today < start_ym:
+            skipped_count += 1
+            continue
+        # 日付が取得できない場合は含める（データ不備でも除外しない）
+        filtered_pids.add(pid)
+
+    if skipped_count > 0:
+        print(f"rpm.csv事前フィルタ: {skipped_count}件の子案件Noを除外（サービスイン済み or 未着手）", file=sys.stderr)
+
+    for pid in filtered_pids:
+        rows = all_rows[pid]
         rpm_phases[pid] = rows
         # 現在工程の判定: 開始日 <= today <= 完了予定日
         current_phase = None
@@ -461,7 +513,6 @@ def load_rpm_data(rpm_path):
                 current_phase = row
                 break
         if current_phase is None:
-            # 該当なし → 最初のレコードを採用
             current_phase = rows[0]
         rpm_data[pid] = current_phase
 
