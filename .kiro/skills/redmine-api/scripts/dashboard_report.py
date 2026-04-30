@@ -916,6 +916,116 @@ def _render_tracker_table(tracker_name, stats, checkpoint_labels, checkpoint_dat
     return "\n".join(parts)
 
 
+# 成果物進捗サマリーの設定
+EXCLUDED_PHASES = {"SP", "PG", "PT", "OT", "05_PS", "01_SP", "09_OT"}
+TEST_PHASES = {"IT", "ST", "UAT", "06_IT", "07_ST", "08_UAT"}
+TEST_SUITE_TRACKER = "テストスイート"
+# テストスイートのカスタムフィールド名（仮。実環境に合わせて変更）
+CF_PLANNED_CASES = "予定ケース数"
+CF_ACTUAL_CASES = "実績ケース数"
+CANCELLED_STATUSES = {"取消", "却下"}
+
+
+def _classify_version_phase(ver_name):
+    """バージョン名からフェーズキーワードを抽出する"""
+    if not ver_name:
+        return None
+    ver_upper = ver_name.upper()
+    for kw in ["02_SA", "03_UC", "04_SS", "06_IT", "07_ST", "08_UAT",
+               "SA", "UC", "SS", "IT", "ST", "UAT"]:
+        if kw in ver_upper or ver_name.startswith(kw):
+            return kw
+    return None
+
+
+def _render_version_progress_table(issues):
+    """工程（バージョン）ごとの成果物/テストスイート進捗サマリーテーブルを生成する"""
+    today = datetime.now(JST).date()
+    version_data = {}
+
+    for issue in issues:
+        ver = issue.get("fixed_version")
+        if not ver:
+            continue
+        ver_name = ver.get("name", "")
+        phase = _classify_version_phase(ver_name)
+        if not phase:
+            continue
+        if any(ex in phase.upper() or ver_name.upper().startswith(ex) for ex in EXCLUDED_PHASES):
+            continue
+        tracker_name = issue.get("tracker", {}).get("name", "")
+        status_name = issue.get("status", {}).get("name", "")
+        if status_name in CANCELLED_STATUSES:
+            continue
+
+        if ver_name not in version_data:
+            version_data[ver_name] = {
+                "phase": phase, "ver_name": ver_name,
+                "is_test": any(tp in phase.upper() for tp in ["IT", "ST", "UAT"]),
+                "deliverable_total": 0, "deliverable_planned": 0, "deliverable_completed": 0,
+                "test_planned_cases": 0, "test_actual_cases": 0, "test_suite_count": 0,
+            }
+        vd = version_data[ver_name]
+
+        if vd["is_test"] and tracker_name == TEST_SUITE_TRACKER:
+            vd["test_suite_count"] += 1
+            for cf in issue.get("custom_fields", []):
+                cn, cv = cf.get("name", ""), cf.get("value", "")
+                if cn == CF_PLANNED_CASES and cv:
+                    try: vd["test_planned_cases"] += int(cv)
+                    except (ValueError, TypeError): pass
+                elif cn == CF_ACTUAL_CASES and cv:
+                    try: vd["test_actual_cases"] += int(cv)
+                    except (ValueError, TypeError): pass
+        elif not vd["is_test"] and tracker_name == "成果物":
+            vd["deliverable_total"] += 1
+            due_str = issue.get("due_date", "")
+            if due_str:
+                try:
+                    if datetime.strptime(due_str, "%Y-%m-%d").date() <= today:
+                        vd["deliverable_planned"] += 1
+                except ValueError:
+                    pass
+            if status_name == "終了":
+                vd["deliverable_completed"] += 1
+
+    if not version_data:
+        return ""
+
+    phase_order = {"02_SA": 1, "SA": 1, "03_UC": 2, "UC": 2, "04_SS": 3, "SS": 3,
+                   "06_IT": 4, "IT": 4, "07_ST": 5, "ST": 5, "08_UAT": 6, "UAT": 6}
+    sorted_versions = sorted(version_data.values(), key=lambda v: phase_order.get(v["phase"], 99))
+
+    parts = ['<div class="sec"><h3>📊 工程別 成果物・テスト進捗</h3>']
+    parts.append('<table style="font:var(--fw) 13px/1.3 var(--ff);"><thead><tr>')
+    parts.append('<th class="tp" style="text-align:left;">工程</th>')
+    parts.append('<th class="tp">種別</th>')
+    parts.append('<th class="tp">総数</th>')
+    parts.append('<th class="tp">予定</th>')
+    parts.append('<th class="tp">完了/実績</th>')
+    parts.append('<th class="tp">達成率</th>')
+    parts.append('</tr></thead><tbody>')
+
+    for vd in sorted_versions:
+        if vd["is_test"]:
+            t, p, a = vd["test_suite_count"], vd["test_planned_cases"], vd["test_actual_cases"]
+            rate = f"{a/p*100:.0f}%" if p > 0 else "-"
+            rc = "var(--c-ok2)" if p > 0 and a >= p else "var(--c-g7)"
+            parts.append(f'<tr><td style="text-align:left;">{vd["ver_name"]}</td><td>テストケース</td>')
+            parts.append(f'<td>{t}スイート</td><td>{p:,}件</td><td>{a:,}件</td>')
+            parts.append(f'<td style="font-weight:var(--fb);color:{rc};">{rate}</td></tr>')
+        else:
+            t, p, c = vd["deliverable_total"], vd["deliverable_planned"], vd["deliverable_completed"]
+            rate = f"{c/p*100:.0f}%" if p > 0 else "-"
+            rc = "var(--c-ok2)" if p > 0 and c >= p else "var(--c-er2)" if p > 0 else "var(--c-g7)"
+            parts.append(f'<tr><td style="text-align:left;">{vd["ver_name"]}</td><td>成果物</td>')
+            parts.append(f'<td>{t}件</td><td>{p}件</td><td>{c}件</td>')
+            parts.append(f'<td style="font-weight:var(--fb);color:{rc};">{rate}</td></tr>')
+
+    parts.append('</tbody></table></div>')
+    return "\n".join(parts)
+
+
 def _render_deliverable_table(deliverable_data, checkpoint_labels, checkpoint_dates):
     """成果物のサマリーバー + コンパクトテーブル + ガント（遅延・進行中の上位10件）を生成する"""
     if not deliverable_data:
@@ -1887,6 +1997,8 @@ th{font-weight:var(--fb);background:var(--c-g1);color:var(--c-g7)}
                 if val:
                     h.append(f'<div><span style="color:var(--c-g5);">{label}:</span> <strong>{val}</strong></div>')
             h.append('</div>')
+        # 工程別 成果物・テスト進捗サマリー
+        h.append(_render_version_progress_table(projects_issues.get(pid, [])))
         # プロマネ報告（最新の進捗報告）
         h.append(_render_progress_report(projects_issues.get(pid, [])))
         # 課題トピック（直近1週間）

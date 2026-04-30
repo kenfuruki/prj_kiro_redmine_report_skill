@@ -201,6 +201,38 @@ def build_mock_data():
             bug["fixed_version"] = {"id": 12, "name": "08_UAT"}
     alpha_issues.extend(bug_issues_alpha)
 
+    # 成果物にバージョン（工程）を設定
+    for issue in alpha_issues:
+        if issue["id"] == 401:
+            issue["fixed_version"] = {"id": 20, "name": "04_SS"}
+        elif issue["id"] == 402:
+            issue["fixed_version"] = {"id": 20, "name": "04_SS"}
+        elif issue["id"] == 403:
+            issue["fixed_version"] = {"id": 21, "name": "03_UC"}
+
+    # テストスイートチケット（IT/STフェーズ）
+    test_suite_issues = [
+        make_issue(1101, "テストスイート", "IT_ログイン機能テスト", 2, "進行中", created_days_ago=10),
+        make_issue(1102, "テストスイート", "IT_検索機能テスト", 5, "終了", created_days_ago=15),
+        make_issue(1103, "テストスイート", "ST_帳票出力テスト", 1, "新規", created_days_ago=5),
+    ]
+    test_suite_issues[0]["fixed_version"] = {"id": 10, "name": "06_IT"}
+    test_suite_issues[0]["custom_fields"] = [
+        {"id": 100, "name": "予定ケース数", "value": "50"},
+        {"id": 101, "name": "実績ケース数", "value": "35"},
+    ]
+    test_suite_issues[1]["fixed_version"] = {"id": 10, "name": "06_IT"}
+    test_suite_issues[1]["custom_fields"] = [
+        {"id": 100, "name": "予定ケース数", "value": "30"},
+        {"id": 101, "name": "実績ケース数", "value": "30"},
+    ]
+    test_suite_issues[2]["fixed_version"] = {"id": 11, "name": "07_ST"}
+    test_suite_issues[2]["custom_fields"] = [
+        {"id": 100, "name": "予定ケース数", "value": "80"},
+        {"id": 101, "name": "実績ケース数", "value": "0"},
+    ]
+    alpha_issues.extend(test_suite_issues)
+
     # --- プロジェクト prj-beta ---
     beta_issues = [
         # 課題: 最近作成
