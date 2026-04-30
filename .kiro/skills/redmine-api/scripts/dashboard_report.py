@@ -473,30 +473,26 @@ def load_rpm_data(rpm_path):
                 all_rows[pid] = []
             all_rows[pid].append(cleaned)
 
-    # 事前フィルタ: 子案件No単位で条件判定（いずれかのレコードで条件を満たせばOK）
+    # 事前フィルタ: 子案件No単位で条件判定
+    # いずれかの工程レコードが両条件を満たせば、その子案件Noの全工程を採用する
     filtered_pids = set()
     skipped_count = 0
     for pid, rows in all_rows.items():
-        # サービスイン予定日: いずれかのレコードから取得（最初に見つかった有効な値）
-        service_in = None
-        start_ym = None
+        pid_qualifies = False
         for row in rows:
-            if not service_in:
-                service_in = _parse_rpm_date(row.get("サービスイン予定日", ""))
-            if not start_ym:
-                start_ym = _parse_rpm_yearmonth(row.get("着手年月", ""))
-
-        # 条件判定
-        # 条件1: 作業日 < サービスイン予定日（まだサービスインしていない）
-        if service_in and today >= service_in:
+            service_in = _parse_rpm_date(row.get("サービスイン予定日", ""))
+            start_ym = _parse_rpm_yearmonth(row.get("着手年月", ""))
+            # 条件1: 作業日 < サービスイン予定日（まだサービスインしていない）
+            cond1 = (service_in is None) or (today < service_in)
+            # 条件2: 作業日 ≧ 着手年月（既に着手している）
+            cond2 = (start_ym is None) or (today >= start_ym)
+            if cond1 and cond2:
+                pid_qualifies = True
+                break  # いずれかの工程で条件を満たせばOK
+        if pid_qualifies:
+            filtered_pids.add(pid)
+        else:
             skipped_count += 1
-            continue
-        # 条件2: 作業日 ≧ 着手年月（既に着手している）
-        if start_ym and today < start_ym:
-            skipped_count += 1
-            continue
-        # 日付が取得できない場合は含める（データ不備でも除外しない）
-        filtered_pids.add(pid)
 
     if skipped_count > 0:
         print(f"rpm.csv事前フィルタ: {skipped_count}件の子案件Noを除外（サービスイン済み or 未着手）", file=sys.stderr)
